@@ -4,7 +4,6 @@ import hmac
 import io
 import json
 import logging
-import math
 import os
 import threading
 import time
@@ -14,2681 +13,878 @@ from decimal import Decimal, ROUND_DOWN
 from urllib.parse import urlencode
 
 import requests
-from flask import (
-    Flask,
-    jsonify,
-    redirect,
-    render_template_string,
-    request,
-    send_file,
-)
+from flask import Flask, jsonify, redirect, render_template_string, request, send_file
 
-# ============================================================
-# BOT PETRÓLEO WTI 3M - BINGX
-# OPERACIONES REALES
-#
-# SEÑALES:
-# LONG  = ABRIR COMPRA
-# SHORT = ABRIR VENTA
-# XL    = CERRAR COMPRA
-# XS    = CERRAR VENTA
-#
-# NO HAY REVERSIÓN AUTOMÁTICA.
-# NO HAY SIMULACIÓN.
-# OFF IMPIDE NUEVAS ENTRADAS.
-# ============================================================
-
-BOT_NAME = "BOT PETRÓLEO WTI 3M"
-BINGX_BASE_URL = "https://open-api.bingx.com"
-
-BINGX_SYMBOL = os.getenv(
-    "BINGX_SYMBOL",
-    "NCCO1OILWTI2USD-USDT",
-).strip().upper()
-
-TV_SYMBOLS = {
-    item.strip().upper()
-    for item in os.getenv(
-        "TV_SYMBOLS",
-        "OILWTIUSDT.P,BINGX:OILWTIUSDT.P,"
-        "OILWTI-USDT,OILWTIUSDT",
-    ).split(",")
-    if item.strip()
-}
-
-BINGX_API_KEY = os.getenv(
-    "BINGX_API_KEY", ""
-).strip()
-
-BINGX_API_SECRET = (
-    os.getenv("BINGX_API_SECRET", "").strip()
-    or os.getenv("BINGX_SECRET_KEY", "").strip()
-)
-
-WEBHOOK_SECRET = os.getenv(
-    "WEBHOOK_SECRET", ""
-).strip()
-
-CONTROL_SECRET = os.getenv(
-    "CONTROL_SECRET",
-    WEBHOOK_SECRET,
-).strip()
-
-MONITOR_SECRET = os.getenv(
-    "MONITOR_SECRET", ""
-).strip()
-
-BALANCE_PERCENT = float(
-    os.getenv("BALANCE_PERCENT", "90")
-)
-
-LEVERAGE = int(
-    os.getenv("LEVERAGE", "2")
-)
-
-FEE_RATE = float(
-    os.getenv("FEE_RATE", "0.0005")
-)
-
-POSITION_MODE = os.getenv(
-    "POSITION_MODE", "HEDGE"
-).strip().upper()
-
-# Historial independiente de Ethereum.
-STATE_PREFIX = "bot_petroleo_wti_3m_v1"
-
-DATA_DIR = os.getenv(
-    "DATA_DIR", "."
-).strip()
-
-UPSTASH_REDIS_REST_URL = os.getenv(
-    "UPSTASH_REDIS_REST_URL", ""
-).strip()
-
-UPSTASH_REDIS_REST_TOKEN = os.getenv(
-    "UPSTASH_REDIS_REST_TOKEN", ""
-).strip()
-
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN", ""
-).strip()
-
-TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID", ""
-).strip()
-
-VALID_MODES = [
-    "OFF",
-    "LONG_ONLY",
-    "SHORT_ONLY",
-    "CLOSE_ONLY",
-    "BOTH",
-]
-
-SIGNAL_LOCK = threading.RLock()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-
-logger = logging.getLogger(BOT_NAME)
-
+# BOT PETROLEO WTI 3 MIN - ORDENES REALES
+# SHORT/LONG: abren solo si FLAT. XL/XS: cierran el lado correspondiente.
+# Sin reversion automatica, sin TP/SL añadidos, sin simulacion.
+BOT_NAME = 'BOT PETRÓLEO WTI 3M'
+BASE = 'https://open-api.bingx.com'
+SYMBOL = os.getenv('BINGX_SYMBOL', 'NCCO1OILWTI2USD-USDT').strip().upper()
+TV_SYMBOLS = {s.strip().upper() for s in os.getenv('TV_SYMBOLS', 'OILWTIUSDT.P,BINGX:OILWTIUSDT.P,OILWTI-USDT,OILWTIUSDT').split(',') if s.strip()}
+API_KEY = os.getenv('BINGX_API_KEY', '').strip()
+API_SECRET = (os.getenv('BINGX_API_SECRET', '') or os.getenv('BINGX_SECRET_KEY', '')).strip()
+WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET', '').strip()
+CONTROL_SECRET = os.getenv('CONTROL_SECRET', WEBHOOK_SECRET).strip()
+MONITOR_SECRET = os.getenv('MONITOR_SECRET', '').strip()
+TG_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
+TG_CHAT = os.getenv('TELEGRAM_CHAT_ID', '').strip()
+BALANCE_PERCENT = float(os.getenv('BALANCE_PERCENT', '90'))
+LEVERAGE = int(os.getenv('LEVERAGE', '2'))
+DATA_DIR = os.getenv('DATA_DIR', '.')
+REDIS_URL = os.getenv('UPSTASH_REDIS_REST_URL', '').strip()
+REDIS_TOKEN = os.getenv('UPSTASH_REDIS_REST_TOKEN', '').strip()
+STATE_PREFIX = 'bot_petroleo_wti_3m_v1'  # No cambiar: preserva historial WTI.
+MODES = ('OFF', 'LONG_ONLY', 'SHORT_ONLY', 'CLOSE_ONLY', 'BOTH')
+LOCK = threading.RLock()
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger('wti-3m')
 
 
-# ============================================================
-# UTILIDADES
-# ============================================================
-
-def utc_now():
+def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def fnum(value, default=0.0):
+def number(x, default=0.0):
     try:
-        return float(value)
+        return float(x)
     except (TypeError, ValueError):
         return default
 
 
-def fint(value, default=0):
+def dec(x):
+    return Decimal(str(x))
+
+
+def epoch_ms(value):
+    if isinstance(value, (int, float)):
+        return int(value if value > 10**12 else value * 1000)
     try:
-        return int(float(value))
+        return int(datetime.fromisoformat(str(value).replace('Z', '+00:00')).timestamp() * 1000)
     except (TypeError, ValueError):
-        return default
+        return 0
 
 
-def secret_matches(received, expected):
-    return (
-        bool(received and expected)
-        and hmac.compare_digest(
-            str(received),
-            str(expected),
-        )
-    )
+def auth(value, expected):
+    return bool(value and expected) and hmac.compare_digest(str(value), str(expected))
 
 
-def redact_error(message):
-    result = str(message)
-
-    for secret in [
-        BINGX_API_KEY,
-        BINGX_API_SECRET,
-        WEBHOOK_SECRET,
-        CONTROL_SECRET,
-        MONITOR_SECRET,
-        UPSTASH_REDIS_REST_TOKEN,
-    ]:
-        if secret:
-            result = result.replace(secret, "***")
-
-    return result
+def safe_error(message):
+    text = str(message)
+    for key in (API_KEY, API_SECRET, WEBHOOK_SECRET, CONTROL_SECRET, MONITOR_SECRET, REDIS_TOKEN, TG_TOKEN):
+        if key:
+            text = text.replace(key, '***')
+    return text[:500]
 
 
-def floor_step(value, step):
-    value = Decimal(str(value))
-    step = Decimal(str(step))
+def telegram(message):
+    if TG_TOKEN and TG_CHAT:
+        try:
+            requests.post(f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage', json={'chat_id': TG_CHAT, 'text': str(message)[:3900]}, timeout=8)
+        except requests.RequestException:
+            logger.exception('Telegram no disponible')
 
-    if step <= 0:
-        raise ValueError("Paso de cantidad inválido")
-
-    units = (value / step).to_integral_value(
-        rounding=ROUND_DOWN
-    )
-
-    return float(units * step)
-
-
-def notify(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-
-    try:
-        requests.post(
-            (
-                "https://api.telegram.org/bot"
-                f"{TELEGRAM_BOT_TOKEN}/sendMessage"
-            ),
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": str(message)[:3900],
-            },
-            timeout=10,
-        )
-    except Exception:
-        logger.exception("Error enviando Telegram")
-
-
-# ============================================================
-# ALMACENAMIENTO
-# ============================================================
 
 class Store:
-
     def __init__(self):
         os.makedirs(DATA_DIR, exist_ok=True)
         self.lock = threading.RLock()
 
     @property
-    def redis_enabled(self):
-        return bool(
-            UPSTASH_REDIS_REST_URL
-            and UPSTASH_REDIS_REST_TOKEN
-        )
+    def redis(self):
+        return bool(REDIS_URL and REDIS_TOKEN)
 
-    def _key(self, name):
-        return f"{STATE_PREFIX}:{name}"
-
-    def _path(self, name):
-        return os.path.join(
-            DATA_DIR,
-            f"{STATE_PREFIX}_{name}.json",
-        )
-
-    def _redis(self, command):
-        response = requests.post(
-            UPSTASH_REDIS_REST_URL.rstrip("/"),
-            headers={
-                "Authorization": (
-                    f"Bearer {UPSTASH_REDIS_REST_TOKEN}"
-                ),
-                "Content-Type": "application/json",
-            },
-            json=command,
-            timeout=12,
-        )
-
+    def cmd(self, args):
+        response = requests.post(REDIS_URL.rstrip('/'), headers={'Authorization': f'Bearer {REDIS_TOKEN}'}, json=args, timeout=12)
         response.raise_for_status()
-        payload = response.json()
-
-        if payload.get("error"):
-            raise RuntimeError(
-                f"Error Upstash: {payload['error']}"
-            )
-
-        return payload.get("result")
+        result = response.json()
+        if result.get('error'):
+            raise RuntimeError('Upstash no pudo guardar o recuperar los datos')
+        return result.get('result')
 
     def get(self, name, default):
         with self.lock:
-            if self.redis_enabled:
-                raw = self._redis([
-                    "GET",
-                    self._key(name),
-                ])
+            if self.redis:
+                raw = self.cmd(['GET', f'{STATE_PREFIX}:{name}'])
                 return json.loads(raw) if raw else default
-
-            path = self._path(name)
-
-            if not os.path.exists(path):
+            path = os.path.join(DATA_DIR, f'{STATE_PREFIX}_{name}.json')
+            if not os.path.isfile(path):
                 return default
-
-            with open(path, "r", encoding="utf-8") as file:
-                return json.load(file)
+            with open(path, encoding='utf-8') as handle:
+                return json.load(handle)
 
     def set(self, name, value):
         with self.lock:
-            raw = json.dumps(
-                value,
-                ensure_ascii=False,
-            )
+            raw = json.dumps(value, ensure_ascii=False)
+            if self.redis:
+                self.cmd(['SET', f'{STATE_PREFIX}:{name}', raw])
+            else:
+                path = os.path.join(DATA_DIR, f'{STATE_PREFIX}_{name}.json')
+                temp = path + '.tmp'
+                with open(temp, 'w', encoding='utf-8') as handle:
+                    handle.write(raw)
+                os.replace(temp, path)
 
-            if self.redis_enabled:
-                self._redis([
-                    "SET",
-                    self._key(name),
-                    raw,
-                ])
-                return
+    def mode(self):
+        selected = self.get('mode', {'mode': 'OFF'}).get('mode', 'OFF')
+        return selected if selected in MODES else 'OFF'
 
-            path = self._path(name)
-            temp = f"{path}.tmp"
+    def trades(self):
+        return self.get('trades', [])
 
-            with open(temp, "w", encoding="utf-8") as file:
-                json.dump(
-                    value,
-                    file,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-
-            os.replace(temp, path)
-
-    def get_mode(self):
-        data = self.get("mode", {})
-        mode = data.get("mode", "OFF")
-        return mode if mode in VALID_MODES else "OFF"
-
-    def set_mode(self, mode):
-        if mode not in VALID_MODES:
-            raise ValueError("Modo inválido")
-
-        self.set("mode", {
-            "mode": mode,
-            "updated_at": utc_now(),
-        })
-
-    def get_active_trade(self):
-        return self.get("active_trade", None)
-
-    def set_active_trade(self, trade):
-        self.set("active_trade", trade)
-
-    def get_trades(self):
-        data = self.get("trades", [])
-        return data if isinstance(data, list) else []
-
-    def set_trades(self, trades):
-        self.set("trades", trades)
-
-    def append_trade(self, trade):
+    def append_trade(self, item):
         with self.lock:
-            trades = self.get_trades()
-            trades.append(trade)
-            self.set_trades(trades)
+            trades = self.trades()
+            if not any(str(t.get('id')) == str(item.get('id')) for t in trades):
+                trades.append(item)
+                self.set('trades', trades)
 
-    def get_events(self):
-        data = self.get("events", [])
-        return data if isinstance(data, list) else []
-
-    def add_event(self, kind, detail):
+    def event(self, kind, detail):
         with self.lock:
-            events = self.get_events()
+            entries = self.get('events', [])
+            entries.append({'time': now(), 'kind': kind, 'detail': safe_error(detail)})
+            self.set('events', entries[-150:])
 
-            events.append({
-                "time": utc_now(),
-                "kind": str(kind),
-                "detail": redact_error(detail),
-            })
+    def seen(self, signal):
+        return signal in self.get('signal_ids', [])
 
-            self.set("events", events[-150:])
-
-    def signal_seen(self, signal_id):
-        ids = self.get("signal_ids", [])
-        return signal_id in ids
-
-    def remember_signal(self, signal_id):
+    def remember(self, signal):
         with self.lock:
-            ids = self.get("signal_ids", [])
-
-            if signal_id not in ids:
-                ids.append(signal_id)
-
-            self.set("signal_ids", ids[-500:])
+            ids = self.get('signal_ids', [])
+            if signal not in ids:
+                ids.append(signal)
+                self.set('signal_ids', ids[-500:])
 
 
 store = Store()
 
 
-# ============================================================
-# API BINGX
-# ============================================================
-
 class BingX:
-
-    def _request(
-        self,
-        method,
-        path,
-        params=None,
-        private=True,
-    ):
+    def call(self, method, path, params=None, private=True):
         params = dict(params or {})
         headers = {}
-
         if private:
-            if not BINGX_API_KEY or not BINGX_API_SECRET:
-                raise RuntimeError(
-                    "Faltan las claves API de BingX"
-                )
-
-            params["timestamp"] = int(time.time() * 1000)
-            params.setdefault("recvWindow", 5000)
-
-            query = urlencode(sorted(params.items()))
-
-            signature = hmac.new(
-                BINGX_API_SECRET.encode(),
-                query.encode(),
-                hashlib.sha256,
-            ).hexdigest()
-
-            url = (
-                f"{BINGX_BASE_URL}{path}"
-                f"?{query}&signature={signature}"
-            )
-
-            headers["X-BX-APIKEY"] = BINGX_API_KEY
-
+            if not API_KEY or not API_SECRET:
+                raise RuntimeError('Faltan claves de BingX')
+            params.update(timestamp=int(time.time() * 1000), recvWindow=5000)
+            encoded = urlencode(sorted(params.items()))
+            sign = hmac.new(API_SECRET.encode(), encoded.encode(), hashlib.sha256).hexdigest()
+            url = f'{BASE}{path}?{encoded}&signature={sign}'
+            headers['X-BX-APIKEY'] = API_KEY
         else:
-            query = urlencode(params)
-            url = f"{BINGX_BASE_URL}{path}"
-
-            if query:
-                url += f"?{query}"
-
-        response = requests.request(
-            method,
-            url,
-            headers=headers,
-            timeout=20,
-        )
-
+            encoded = urlencode(params)
+            url = f'{BASE}{path}' + (f'?{encoded}' if encoded else '')
+        response = requests.request(method, url, headers=headers, timeout=20)
         try:
-            payload = response.json()
-        except Exception:
-            raise RuntimeError(
-                f"Respuesta no JSON de BingX: "
-                f"HTTP {response.status_code}"
-            )
-
-        if (
-            response.status_code >= 400
-            or str(payload.get("code")) != "0"
-        ):
-            raise RuntimeError(
-                f"Error BingX: {payload}"
-            )
-
-        return payload
-
-    # --------------------------------------------------------
-    # PRECIO
-    # --------------------------------------------------------
+            result = response.json()
+        except ValueError:
+            raise RuntimeError(f'BingX no devolvió JSON (HTTP {response.status_code})')
+        if response.status_code >= 400 or str(result.get('code')) != '0':
+            raise RuntimeError('Error BingX: ' + safe_error(result))
+        return result.get('data')
 
     def price(self):
-        payload = self._request(
-            "GET",
-            "/openApi/swap/v2/quote/price",
-            {"symbol": BINGX_SYMBOL},
-            private=False,
-        )
-
-        data = payload.get("data", {})
-
+        data = self.call('GET', '/openApi/swap/v2/quote/price', {'symbol': SYMBOL}, False)
         if isinstance(data, list):
             data = data[0] if data else {}
-
-        price = fnum(
-            data.get("price")
-            or data.get("lastPrice")
-        )
-
+        price = number((data or {}).get('price') or (data or {}).get('lastPrice'))
         if price <= 0:
-            raise RuntimeError(
-                "No se pudo obtener el precio WTI"
-            )
-
+            raise RuntimeError('Precio WTI no disponible')
         return price
 
-    # --------------------------------------------------------
-    # BALANCE
-    # --------------------------------------------------------
-
-    def available_balance(self):
-        payload = self._request(
-            "GET",
-            "/openApi/swap/v3/user/balance",
-        )
-
-        data = payload.get("data", {})
-        candidates = []
-
+    def contract(self):
+        data = self.call('GET', '/openApi/swap/v2/quote/contracts', private=False)
         if isinstance(data, dict):
-            for key in ["balance", "balances"]:
-                nested = data.get(key)
+            data = data.get('contracts') or data.get('data') or [data]
+        found = [c for c in (data or []) if isinstance(c, dict) and str(c.get('symbol', '')).upper() == SYMBOL]
+        if len(found) != 1:
+            raise RuntimeError('Contrato WTI no encontrado de manera única')
+        c = found[0]
+        precision = c.get('quantityPrecision')
+        minimum = number(c.get('tradeMinQuantity') or c.get('minQty'))
+        if precision is None or minimum <= 0:
+            raise RuntimeError('Datos de cantidad incompletos en el contrato')
+        return {'step': str(Decimal('1').scaleb(-int(precision))), 'minimum': minimum, 'min_notional': number(c.get('tradeMinUSDT')), 'raw': c}
 
-                if isinstance(nested, dict):
-                    candidates.append(nested)
-
-                elif isinstance(nested, list):
-                    candidates.extend(nested)
-
-            candidates.append(data)
-
-        elif isinstance(data, list):
-            candidates.extend(data)
-
-        for item in candidates:
-            if not isinstance(item, dict):
+    def balance(self):
+        data = self.call('GET', '/openApi/swap/v3/user/balance')
+        items = []
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            for item in (data.get('balance'), data.get('balances'), data):
+                items += item if isinstance(item, list) else [item] if isinstance(item, dict) else []
+        for item in items:
+            if not isinstance(item, dict) or str(item.get('asset') or item.get('currency') or 'USDT').upper() != 'USDT':
                 continue
-
-            asset = str(
-                item.get("asset")
-                or item.get("currency")
-                or item.get("coin")
-                or ""
-            ).upper()
-
-            if asset and asset != "USDT":
-                continue
-
-            for key in [
-                "availableMargin",
-                "availableBalance",
-                "available",
-            ]:
-                if key in item:
-                    value = fnum(item[key], -1)
-
-                    if value >= 0:
-                        return value
-
-        raise RuntimeError(
-            "No se pudo leer el balance USDT disponible"
-        )
-
-    # --------------------------------------------------------
-    # REGLAS DEL CONTRATO
-    # --------------------------------------------------------
-
-    def contract_rules(self):
-        payload = self._request(
-            "GET",
-            "/openApi/swap/v2/quote/contracts",
-            private=False,
-        )
-
-        data = payload.get("data", [])
-
-        if isinstance(data, dict):
-            data = (
-                data.get("contracts")
-                or data.get("data")
-                or [data]
-            )
-
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-
-            if (
-                str(item.get("symbol", "")).upper()
-                != BINGX_SYMBOL
-            ):
-                continue
-
-            precision = item.get("quantityPrecision")
-
-            if precision is None:
-                raise RuntimeError(
-                    "El contrato no informa quantityPrecision"
-                )
-
-            step = Decimal(1).scaleb(-int(precision))
-
-            minimum = fnum(
-                item.get("tradeMinQuantity")
-                or item.get("minQty")
-                or item.get("minQuantity")
-            )
-
-            if minimum <= 0:
-                raise RuntimeError(
-                    "El contrato no informa cantidad mínima"
-                )
-
-            return {
-                "symbol": BINGX_SYMBOL,
-                "step": float(step),
-                "minimum": minimum,
-                "quantity_precision": int(precision),
-                "min_notional": fnum(
-                    item.get("tradeMinUSDT")
-                    or item.get("minNotional")
-                    or item.get("minTradeUSDT")
-                ),
-                "size": item.get("size"),
-                "status": item.get("status"),
-                "api_state": item.get("apiState"),
-                "raw": item,
-            }
-
-        raise RuntimeError(
-            f"Contrato {BINGX_SYMBOL} no encontrado "
-            "en BingX"
-        )
-
-    # --------------------------------------------------------
-    # POSICIONES REALES
-    # --------------------------------------------------------
+            for key in ('availableMargin', 'availableBalance', 'available'):
+                if key in item and number(item[key], -1) >= 0:
+                    return number(item[key])
+        raise RuntimeError('Balance USDT disponible no encontrado')
 
     def positions(self):
-        payload = self._request(
-            "GET",
-            "/openApi/swap/v2/user/positions",
-            {"symbol": BINGX_SYMBOL},
-        )
-
-        data = payload.get("data", [])
-
+        data = self.call('GET', '/openApi/swap/v2/user/positions', {'symbol': SYMBOL})
         if isinstance(data, dict):
             data = [data]
-
-        result = []
-
-        for item in data or []:
-            if not isinstance(item, dict):
+        output = []
+        for p in data or []:
+            if not isinstance(p, dict) or str(p.get('symbol', SYMBOL)).upper() != SYMBOL:
                 continue
-
-            symbol = str(
-                item.get("symbol", "")
-            ).upper()
-
-            if symbol and symbol != BINGX_SYMBOL:
+            qty = number(p.get('positionAmt') if p.get('positionAmt') is not None else p.get('positionAmount') if p.get('positionAmount') is not None else p.get('availableAmt') if p.get('availableAmt') is not None else p.get('quantity'))
+            if qty == 0:
                 continue
+            side = str(p.get('positionSide', '')).upper()
+            if side not in ('LONG', 'SHORT'):
+                side = 'LONG' if qty > 0 else 'SHORT'
+            output.append({'side': side, 'quantity': abs(qty), 'entry_price': number(p.get('avgPrice') or p.get('entryPrice')), 'leverage': number(p.get('leverage'), LEVERAGE), 'margin_used': number(p.get('initialMargin') or p.get('isolatedMargin') or p.get('margin')), 'unrealized_pnl': number(p.get('unrealizedProfit') or p.get('unrealizedPnl'))})
+        return output
 
-            amount = fnum(
-                item.get("positionAmt")
-                if item.get("positionAmt") is not None
-                else item.get("positionAmount")
-                if item.get("positionAmount") is not None
-                else item.get("availableAmt")
-                if item.get("availableAmt") is not None
-                else item.get("quantity")
-            )
-
-            if abs(amount) <= 0:
-                continue
-
-            side = str(
-                item.get("positionSide", "")
-            ).upper()
-
-            if side not in {"LONG", "SHORT"}:
-                side = "LONG" if amount > 0 else "SHORT"
-
-            result.append({
-                "side": side,
-                "quantity": abs(amount),
-                "entry_price": fnum(
-                    item.get("avgPrice")
-                    or item.get("entryPrice")
-                ),
-                "leverage": fint(
-                    item.get("leverage"),
-                    LEVERAGE,
-                ),
-                "margin_used": fnum(
-                    item.get("initialMargin")
-                    or item.get("isolatedMargin")
-                    or item.get("margin")
-                ),
-                "unrealized_pnl": fnum(
-                    item.get("unrealizedProfit")
-                    or item.get("unrealizedPnl")
-                ),
-                "liquidation_price": fnum(
-                    item.get("liquidationPrice")
-                ),
-            })
-
-        return result
-
-    # --------------------------------------------------------
-    # HEDGE
-    # --------------------------------------------------------
-
-    def position_mode_is_hedge(self):
-        payload = self._request(
-            "GET",
-            "/openApi/swap/v1/positionSide/dual",
-        )
-
-        data = payload.get("data", {})
-
-        raw = (
-            data.get("dualSidePosition")
-            if isinstance(data, dict)
-            else data
-        )
-
-        if isinstance(raw, bool):
-            return raw
-
-        return str(raw).lower() == "true"
-
-    def ensure_position_mode(self):
-        if POSITION_MODE != "HEDGE":
-            raise RuntimeError(
-                "Este bot requiere POSITION_MODE=HEDGE"
-            )
-
-        if self.position_mode_is_hedge():
-            return
-
-        self._request(
-            "POST",
-            "/openApi/swap/v1/positionSide/dual",
-            {"dualSidePosition": "true"},
-        )
-
-    # --------------------------------------------------------
-    # MARGEN
-    # --------------------------------------------------------
+    def hedge(self):
+        data = self.call('GET', '/openApi/swap/v1/positionSide/dual')
+        value = data.get('dualSidePosition') if isinstance(data, dict) else data
+        return value is True or str(value).lower() == 'true'
 
     def margin_type(self):
-        payload = self._request(
-            "GET",
-            "/openApi/swap/v2/trade/marginType",
-            {"symbol": BINGX_SYMBOL},
-        )
+        data = self.call('GET', '/openApi/swap/v2/trade/marginType', {'symbol': SYMBOL})
+        return str(data.get('marginType', '')).upper() if isinstance(data, dict) else ''
 
-        data = payload.get("data", {})
+    def configure(self):
+        if not self.hedge():
+            self.call('POST', '/openApi/swap/v1/positionSide/dual', {'dualSidePosition': 'true'})
+        if self.margin_type() != 'ISOLATED':
+            self.call('POST', '/openApi/swap/v2/trade/marginType', {'symbol': SYMBOL, 'marginType': 'ISOLATED'})
+        for direction in ('LONG', 'SHORT'):
+            self.call('POST', '/openApi/swap/v2/trade/leverage', {'symbol': SYMBOL, 'side': direction, 'leverage': LEVERAGE})
 
-        return str(
-            data.get("marginType", "")
-            if isinstance(data, dict)
-            else ""
-        ).upper()
+    def order(self, side, direction, quantity):
+        data = self.call('POST', '/openApi/swap/v2/trade/order', {'symbol': SYMBOL, 'side': side, 'positionSide': direction, 'type': 'MARKET', 'quantity': quantity})
+        if isinstance(data, dict) and isinstance(data.get('order'), dict):
+            data = data['order']
+        return data if isinstance(data, dict) else {}
 
-    def set_isolated(self):
-        if self.margin_type() == "ISOLATED":
-            return
+    def order_detail(self, order_id):
+        data = self.call('GET', '/openApi/swap/v2/trade/order', {'symbol': SYMBOL, 'orderId': str(order_id)})
+        if isinstance(data, dict) and isinstance(data.get('order'), dict):
+            data = data['order']
+        return data if isinstance(data, dict) else {}
 
-        self._request(
-            "POST",
-            "/openApi/swap/v2/trade/marginType",
-            {
-                "symbol": BINGX_SYMBOL,
-                "marginType": "ISOLATED",
-            },
-        )
-
-    # --------------------------------------------------------
-    # APALANCAMIENTO
-    # --------------------------------------------------------
-
-    def set_leverage(self):
-        for side in ["LONG", "SHORT"]:
-            self._request(
-                "POST",
-                "/openApi/swap/v2/trade/leverage",
-                {
-                    "symbol": BINGX_SYMBOL,
-                    "side": side,
-                    "leverage": LEVERAGE,
-                },
-            )
-
-    # --------------------------------------------------------
-    # CÁLCULO DE CANTIDAD
-    # --------------------------------------------------------
-
-    def quantity(self):
-        balance = self.available_balance()
-        price = self.price()
-        rules = self.contract_rules()
-
-        margin = balance * BALANCE_PERCENT / 100
-        notional = margin * LEVERAGE
-
-        if margin <= 0:
-            raise RuntimeError(
-                "Balance insuficiente"
-            )
-
-        # Para contratos lineales cuya cantidad representa
-        # unidades del activo subyacente.
-        #
-        # La API debe confirmar que el contrato utiliza
-        # esa convención antes de confiar en el resultado.
-        #
-        # Si BingX devuelve una unidad contractual distinta,
-        # el cálculo debe ajustarse a esa especificación.
-
-        quantity = floor_step(
-            notional / price,
-            rules["step"],
-        )
-
-        if quantity < rules["minimum"]:
-            raise RuntimeError(
-                f"Cantidad {quantity} inferior al mínimo "
-                f"{rules['minimum']}. "
-                f"Balance: {balance:.4f} USDT"
-            )
-
-        if (
-            rules["min_notional"] > 0
-            and quantity * price < rules["min_notional"]
-        ):
-            raise RuntimeError(
-                "La orden no alcanza el nocional mínimo"
-            )
-
-        return {
-            "balance": balance,
-            "price": price,
-            "margin": margin,
-            "notional": notional,
-            "quantity": quantity,
-            "rules": rules,
-        }
-
-    # --------------------------------------------------------
-    # ORDEN MARKET REAL
-    # --------------------------------------------------------
-
-    def market_order(
-        self,
-        order_side,
-        direction,
-        quantity,
-    ):
-        rules = self.contract_rules()
-
-        quantity = floor_step(
-            quantity,
-            rules["step"],
-        )
-
-        if quantity <= 0:
-            raise RuntimeError(
-                "La cantidad de la orden es cero"
-            )
-
-        payload = self._request(
-            "POST",
-            "/openApi/swap/v2/trade/order",
-            {
-                "symbol": BINGX_SYMBOL,
-                "side": order_side,
-                "positionSide": direction,
-                "type": "MARKET",
-                "quantity": quantity,
-            },
-        )
-
-        data = payload.get("data", {})
-
+    def orders_window(self, start_ms, end_ms):
+        data = self.call('GET', '/openApi/swap/v2/trade/allOrders', {'symbol': SYMBOL, 'startTime': start_ms, 'endTime': end_ms, 'limit': 1000})
         if isinstance(data, dict):
-            return data.get("order", data)
+            data = data.get('orders') or data.get('list') or data.get('data') or []
+        return data if isinstance(data, list) else []
 
-        return {}
+    def fills(self, order_id, start_ms, end_ms):
+        # Endpoint oficial con filtro exacto por orderId.
+        data = self.call('GET', '/openApi/swap/v2/trade/fillHistory', {'symbol': SYMBOL, 'orderId': str(order_id), 'startTs': start_ms, 'endTs': end_ms, 'pageIndex': 1, 'pageSize': 1000})
+        if isinstance(data, dict):
+            data = data.get('fill_orders') or data.get('list') or data.get('fills') or []
+        if not isinstance(data, list) or len(data) >= 1000:
+            raise RuntimeError('Historial de ejecuciones incompleto; no se sumará PnL')
+        return [f for f in data if isinstance(f, dict) and str(f.get('orderId') or f.get('orderID')) == str(order_id) and str(f.get('symbol', SYMBOL)).upper() == SYMBOL]
+
+    def funding(self, start_ms, end_ms):
+        data = self.call('GET', '/openApi/swap/v2/user/income', {'symbol': SYMBOL, 'incomeType': 'FUNDING_FEE', 'startTime': start_ms, 'endTime': end_ms, 'limit': 1000})
+        if isinstance(data, dict):
+            data = data.get('list') or data.get('data') or []
+        if not isinstance(data, list) or len(data) >= 1000:
+            raise RuntimeError('Historial de funding incompleto')
+        return sum(number(item.get('income')) for item in data if isinstance(item, dict) and str(item.get('symbol', SYMBOL)).upper() == SYMBOL and item.get('incomeType') == 'FUNDING_FEE' and start_ms <= int(number(item.get('time'))) <= end_ms)
 
 
 bingx = BingX()
 
 
-# ============================================================
-# SINCRONIZACIÓN DE POSICIONES
-# ============================================================
-
 def sync_position():
     positions = bingx.positions()
-    stored = store.get_active_trade()
-
     if len(positions) > 1:
-        return {
-            "status": "warning",
-            "reason": "multiple_positions",
-            "positions": positions,
-        }
-
-    if not positions:
-        if stored:
-            store.set_active_trade(None)
-
-        return {
-            "status": "flat",
-            "position": None,
-        }
-
-    live = positions[0]
-
-    if not stored:
-        stored = {
-            "id": str(uuid.uuid4()),
-            "opened_at": utc_now(),
-            "side": live["side"],
-            "symbol": BINGX_SYMBOL,
-            "quantity": live["quantity"],
-            "entry_price": live["entry_price"],
-            "leverage": live["leverage"],
-            "margin_used": live["margin_used"],
-            "source": "MANUAL_SYNC",
-        }
-
-        store.add_event(
-            "MANUAL_SYNC",
-            f"Posición {live['side']} adoptada",
-        )
-
-    else:
-        for key in [
-            "side",
-            "quantity",
-            "entry_price",
-            "leverage",
-            "margin_used",
-        ]:
-            stored[key] = live[key]
-
-    store.set_active_trade(stored)
-
-    return {
-        "status": "synced",
-        "position": {
-            **stored,
-            **live,
-        },
-    }
+        raise RuntimeError('Varias posiciones WTI detectadas: revisar BingX')
+    live = positions[0] if positions else None
+    saved = store.get('active_trade', None)
+    if live:
+        if not saved or saved.get('side') != live['side']:
+            saved = {'id': str(uuid.uuid4()), 'opened_at': now(), 'side': live['side'], 'symbol': SYMBOL, 'source': 'MANUAL_SYNC'}
+            store.event('SYNC', f'Posición {live["side"]} recuperada desde BingX')
+        saved.update({key: live[key] for key in ('side', 'quantity', 'entry_price', 'leverage', 'margin_used')})
+        store.set('active_trade', saved)
+    elif saved:
+        store.event('SYNC_WARNING', 'Posición ausente en BingX; revisar cierre externo y PnL')
+        store.set('active_trade', None)
+    return live
 
 
-def wait_for_position(
-    direction=None,
-    timeout=8,
-):
-    deadline = time.time() + timeout
-
-    while time.time() < deadline:
+def wait_position(direction=None, timeout=9):
+    end = time.time() + timeout
+    while time.time() < end:
         positions = bingx.positions()
-
-        if direction is None:
-            if not positions:
-                return None
-
-        else:
-            for position in positions:
-                if position["side"] == direction:
-                    return position
-
+        if len(positions) > 1:
+            raise RuntimeError('Hay varias posiciones; revisar cuenta')
+        if direction is None and not positions:
+            return None
+        if direction and len(positions) == 1 and positions[0]['side'] == direction:
+            return positions[0]
         time.sleep(0.4)
+    raise RuntimeError('Orden enviada pero BingX aún no confirma estado. Verificar cuenta antes de repetir')
 
-    return False
-
-
-# ============================================================
-# APERTURA REAL
-# ============================================================
 
 def open_trade(direction):
-    sync = sync_position()
+    if sync_position():
+        return {'status': 'ignored', 'reason': 'position_already_open'}
+    if not 0 < BALANCE_PERCENT <= 100 or LEVERAGE < 1:
+        raise RuntimeError('Porcentaje o leverage inválido')
+    rules = bingx.contract()
+    price = bingx.price()
+    balance = bingx.balance()
+    margin = balance * BALANCE_PERCENT / 100
+    qty_dec = (dec(margin * LEVERAGE / price) / dec(rules['step'])).to_integral_value(rounding=ROUND_DOWN) * dec(rules['step'])
+    if float(qty_dec) < rules['minimum'] or (rules['min_notional'] and float(qty_dec) * price < rules['min_notional']):
+        raise RuntimeError('Saldo insuficiente para la cantidad mínima WTI')
+    qty = format(qty_dec, 'f')
+    bingx.configure()
+    order = bingx.order('BUY' if direction == 'LONG' else 'SELL', direction, qty)
+    live = wait_position(direction)
+    trade = {'id': str(uuid.uuid4()), 'opened_at': now(), 'side': direction, 'symbol': SYMBOL, 'quantity': live['quantity'], 'entry_price': live['entry_price'], 'leverage': live['leverage'], 'margin_used': live['margin_used'] or margin, 'balance_before': balance, 'open_order_id': str(order.get('orderID') or order.get('orderId') or ''), 'source': 'AUTO'}
+    store.set('active_trade', trade)
+    store.event('ORDER_OPENED', f'{direction} qty={trade["quantity"]} price={trade["entry_price"]}')
+    telegram(f'{BOT_NAME}\nAPERTURA {direction}\nPrecio: {trade["entry_price"]}\nCantidad: {trade["quantity"]}')
+    return {'status': 'opened', 'trade': trade}
 
-    if sync.get("reason") == "multiple_positions":
-        return {
-            "status": "blocked",
-            "reason": "multiple_positions",
-        }
 
-    if sync.get("position"):
-        return {
-            "status": "ignored",
-            "reason": "position_already_open",
-        }
-
-    calculation = bingx.quantity()
-
-    bingx.ensure_position_mode()
-    bingx.set_isolated()
-    bingx.set_leverage()
-
-    order_side = (
-        "BUY" if direction == "LONG" else "SELL"
-    )
-
-    order = bingx.market_order(
-        order_side,
-        direction,
-        calculation["quantity"],
-    )
-
-    live = wait_for_position(direction)
-
-    if not live:
-        store.add_event(
-            "OPEN_UNCONFIRMED",
-            f"{direction} enviado; posición sin confirmar",
-        )
-
-        raise RuntimeError(
-            "Orden enviada pero posición no confirmada. "
-            "Revisar BingX antes de reintentar."
-        )
-
+def close_trade(direction, reason):
+    live = sync_position()
+    if not live or live['side'] != direction:
+        return {'status': 'ignored', 'reason': 'no_matching_position'}
+    saved = store.get('active_trade', None) or {}
+    order = bingx.order('SELL' if direction == 'LONG' else 'BUY', direction, live['quantity'])
+    wait_position(None)
     trade = {
-        "id": str(uuid.uuid4()),
-        "opened_at": utc_now(),
-        "side": direction,
-        "symbol": BINGX_SYMBOL,
-        "quantity": live["quantity"],
-        "entry_price": live["entry_price"],
-        "leverage": live["leverage"],
-        "margin_used": (
-            live["margin_used"]
-            or calculation["margin"]
-        ),
-        "balance_before": calculation["balance"],
-        "open_order_id": order.get("orderId"),
-        "source": "AUTO",
+        'id': saved.get('id') or str(uuid.uuid4()), 'opened_at': saved.get('opened_at', now()), 'closed_at': now(),
+        'side': direction, 'symbol': SYMBOL, 'quantity': live['quantity'], 'entry_price': live['entry_price'],
+        'exit_price': 0, 'leverage': live['leverage'], 'margin_used': live['margin_used'],
+        'open_order_id': str(saved.get('open_order_id') or ''),
+        'close_order_id': str(order.get('orderID') or order.get('orderId') or ''),
+        'gross_pnl': 0, 'total_fees': 0, 'funding': 0, 'net_pnl': 0, 'pnl_pending': True,
+        'risk_usd': 0, 'r_multiple': 0, 'price_move_pct': 0,
+        'balance_before': saved.get('balance_before', 0), 'source': saved.get('source', 'AUTO'),
+        'close_reason': reason,
     }
-
-    store.set_active_trade(trade)
-
-    store.add_event(
-        "ORDER_OPENED",
-        (
-            f"{direction} qty={live['quantity']} "
-            f"price={live['entry_price']}"
-        ),
-    )
-
-    notify(
-        f"{BOT_NAME}\n"
-        f"APERTURA {direction}\n"
-        f"Precio: {live['entry_price']}\n"
-        f"Cantidad: {live['quantity']}\n"
-        f"Margen: ISOLATED\n"
-        f"Apalancamiento: {LEVERAGE}x"
-    )
-
-    return {
-        "status": "opened",
-        "trade": trade,
-    }
+    store.append_trade(trade)
+    store.set('active_trade', None)
+    store.event('ORDER_CLOSED', f'{direction} cerrado: iniciando conciliación del PnL')
+    telegram(f'{BOT_NAME}\nCIERRE {direction}\nConsultando PnL real de BingX')
+    try:
+        reconcile_pending(force=True)
+    except Exception as exc:
+        store.event('PNL_ERROR', safe_error(exc))
+    return {'status': 'closed', 'trade_id': trade['id'], 'pnl_status': 'ver panel'}
 
 
-# ============================================================
-# CIERRE REAL
-# ============================================================
-
-def close_trade(expected_direction, reason):
-    sync = sync_position()
-
-    if sync.get("reason") == "multiple_positions":
-        return {
-            "status": "blocked",
-            "reason": "multiple_positions",
-        }
-
-    live = sync.get("position")
-
-    if not live:
-        return {
-            "status": "ignored",
-            "reason": "no_position",
-        }
-
-    if live["side"] != expected_direction:
-        return {
-            "status": "ignored",
-            "reason": "wrong_position_side",
-        }
-
-    saved = store.get_active_trade() or {}
-
-    direction = live["side"]
-
-    order_side = (
-        "SELL" if direction == "LONG" else "BUY"
-    )
-
-    order = bingx.market_order(
-        order_side,
-        direction,
-        live["quantity"],
-    )
-
-    flat = wait_for_position(None)
-
-    if flat is False:
-        store.add_event(
-            "CLOSE_UNCONFIRMED",
-            (
-                f"{direction} cierre enviado; "
-                "BingX aún muestra posición"
-            ),
-        )
-
-        raise RuntimeError(
-            "Cierre enviado pero BingX no confirmó FLAT"
-        )
-
-    # El cierre se registra sin inventar un PnL.
-    # El PnL exacto requiere consultar fills,
-    # comisiones y funding de BingX.
-
-    closed = {
-        "id": saved.get("id") or str(uuid.uuid4()),
-        "opened_at": saved.get("opened_at", utc_now()),
-        "closed_at": utc_now(),
-        "side": direction,
-        "symbol": BINGX_SYMBOL,
-        "entry_price": live["entry_price"],
-        "exit_price": 0,
-        "quantity": live["quantity"],
-        "leverage": live["leverage"],
-        "margin_used": live["margin_used"],
-        "gross_pnl": 0,
-        "total_fees": 0,
-        "funding": 0,
-        "net_pnl": 0,
-        "pnl_pending": True,
-        "risk_usd": 0,
-        "r_multiple": 0,
-        "price_move_pct": 0,
-        "source": saved.get("source", "AUTO"),
-        "close_reason": reason,
-        "close_order_id": order.get("orderId"),
-    }
-
-    store.append_trade(closed)
-    store.set_active_trade(None)
-
-    store.add_event(
-        "ORDER_CLOSED",
-        f"{direction} cerrado por {reason}",
-    )
-
-    notify(
-        f"{BOT_NAME}\n"
-        f"CIERRE {direction}\n"
-        f"Motivo: {reason}\n"
-        "PnL: pendiente de conciliación"
-    )
-
-    return {
-        "status": "closed",
-        "trade": closed,
-    }
+def order_key(item):
+    return str(item.get('orderID') or item.get('orderId') or '')
 
 
-# ============================================================
-# LÓGICA DE LAS CUATRO SEÑALES
-# ============================================================
+def resolve_old_open_id(trade):
+    # Para operaciones previas que guardaron close_order_id pero no open_order_id.
+    opened = epoch_ms(trade.get('opened_at'))
+    if not opened:
+        return ''
+    orders = bingx.orders_window(max(0, opened - 120000), opened + 120000)
+    expected = 'SELL' if trade.get('side') == 'SHORT' else 'BUY'
+    candidates = []
+    for item in orders:
+        if not isinstance(item, dict):
+            continue
+        timestamp = int(number(item.get('time') or item.get('updateTime')))
+        price = number(item.get('avgPrice') or item.get('price'))
+        qty = number(item.get('executedQty') or item.get('origQty') or item.get('quantity'))
+        if (str(item.get('symbol', SYMBOL)).upper() == SYMBOL
+            and str(item.get('side', '')).upper() == expected
+            and str(item.get('positionSide', trade['side'])).upper() == trade['side']
+            and str(item.get('status', '')).upper() == 'FILLED'
+            and timestamp and abs(timestamp - opened) <= 120000
+            and price and abs(price - number(trade.get('entry_price'))) <= 0.06
+            and qty and abs(qty - number(trade.get('quantity'))) <= 0.0001
+            and order_key(item)):
+            candidates.append(order_key(item))
+    return candidates[0] if len(set(candidates)) == 1 else ''
+
+
+def confirmed_fill_summary(fills):
+    if not fills:
+        raise RuntimeError('Todavía no se publicaron las ejecuciones de la orden')
+    gross = Decimal('0')
+    fees = Decimal('0')
+    qty = Decimal('0')
+    weighted = Decimal('0')
+    for fill in fills:
+        qty_raw = fill.get('qty') or fill.get('volume') or fill.get('quantity')
+        price_raw = fill.get('price') or fill.get('tradePrice')
+        if qty_raw is None or price_raw is None or fill.get('realizedPnl') is None:
+            raise RuntimeError('Ejecución BingX incompleta (qty/price/realizedPnl)')
+        unit_qty, unit_price = dec(qty_raw), dec(price_raw)
+        qty += unit_qty
+        weighted += unit_qty * unit_price
+        gross += dec(fill['realizedPnl'])
+        fee_raw = fill.get('fee') if fill.get('fee') is not None else fill.get('commission')
+        if fee_raw is None:
+            raise RuntimeError('BingX no devolvió las comisiones de una ejecución')
+        fees += abs(dec(fee_raw))
+    if qty <= 0:
+        raise RuntimeError('Cantidad ejecutada igual a cero')
+    return {'qty': qty, 'price': weighted / qty, 'gross': gross, 'fees': fees}
+
+
+def reconcile_one(trade):
+    if not trade.get('pnl_pending'):
+        return None
+    if trade.get('symbol', SYMBOL) != SYMBOL:
+        raise RuntimeError('El símbolo de la operación no coincide con WTI')
+    start = epoch_ms(trade.get('opened_at'))
+    end = epoch_ms(trade.get('closed_at'))
+    if not start or not end or end < start:
+        raise RuntimeError('Fechas incompletas para conciliar')
+    open_id = str(trade.get('open_order_id') or '')
+    close_id = str(trade.get('close_order_id') or '')
+    if not close_id:
+        raise RuntimeError('No hay ID de orden de cierre para asociar PnL')
+    if not open_id:
+        open_id = resolve_old_open_id(trade)
+    if not open_id:
+        raise RuntimeError('No se identificó de forma única la orden de entrada')
+    order_a = bingx.order_detail(open_id)
+    order_b = bingx.order_detail(close_id)
+    if (order_key(order_a) != open_id or order_key(order_b) != close_id
+        or str(order_a.get('status', '')).upper() != 'FILLED'
+        or str(order_b.get('status', '')).upper() != 'FILLED'):
+        raise RuntimeError('BingX aún no confirmó ambas órdenes como FILLED')
+    if (str(order_a.get('symbol', SYMBOL)).upper() != SYMBOL
+        or str(order_b.get('symbol', SYMBOL)).upper() != SYMBOL):
+        raise RuntimeError('ID de orden pertenece a otro símbolo')
+    if (str(order_a.get('positionSide', trade['side'])).upper() != trade['side']
+        or str(order_b.get('positionSide', trade['side'])).upper() != trade['side']):
+        raise RuntimeError('La dirección del trade no coincide con las órdenes')
+    # El margen temporal cubre diferencias entre TradingView, Railway y fill real.
+    start_ms = max(0, start - 300000)
+    end_ms = min(int(time.time() * 1000), end + 300000)
+    a = confirmed_fill_summary(bingx.fills(open_id, start_ms, end_ms))
+    b = confirmed_fill_summary(bingx.fills(close_id, start_ms, end_ms))
+    if abs(float(a['qty'] - b['qty'])) > max(0.00001, number(trade.get('quantity')) * 0.001):
+        raise RuntimeError('Cantidades apertura/cierre no coinciden')
+    if abs(float(a['qty']) - number(trade.get('quantity'))) > max(0.00001, number(trade.get('quantity')) * 0.001):
+        raise RuntimeError('Cantidad de fills no coincide con la posición guardada')
+    # Funding es flujo de caja firmado: positivo = recibido, negativo = pagado.
+    funding = dec(bingx.funding(start, end))
+    gross = b['gross'] + a['gross']
+    fees = a['fees'] + b['fees']
+    net = gross - fees + funding
+    entry, exit_price = float(a['price']), float(b['price'])
+    updated = dict(trade)
+    updated.update({
+        'open_order_id': open_id, 'exit_price': exit_price,
+        'entry_price': entry, 'gross_pnl': float(gross),
+        'total_fees': float(fees), 'funding': float(funding),
+        'net_pnl': float(net), 'pnl_pending': False,
+        'pnl_source': 'BINGX_FILLS_AND_FUNDING',
+        'price_move_pct': (exit_price - entry) / entry * 100 * (1 if trade['side'] == 'LONG' else -1),
+    })
+    risk = number(trade.get('risk_usd'))
+    updated['r_multiple'] = float(net) / risk if risk > 0 else 0
+    return updated
+
+
+def reconcile_pending(force=False):
+    # Solo READ de BingX. Modifica el mismo registro, no crea operaciones nuevas.
+    with LOCK:
+        previous = number(store.get('last_reconcile', 0))
+        if not force and time.time() - previous < 20:
+            return {'checked': False, 'reason': 'cooldown'}
+        store.set('last_reconcile', time.time())
+        trades = store.trades()
+        changed = 0
+        waiting = []
+        for index, item in enumerate(trades):
+            if not item.get('pnl_pending'):
+                continue
+            try:
+                complete = reconcile_one(item)
+                if complete:
+                    trades[index] = complete
+                    store.set('trades', trades)
+                    changed += 1
+                    store.event('PNL_CONFIRMED', f'{item.get("side")} neto {complete["net_pnl"]:+.4f} USDT')
+                    telegram(f'{BOT_NAME}\nPnL confirmado: {complete["net_pnl"]:+.4f} USDT')
+            except Exception as exc:
+                waiting.append(safe_error(exc))
+        return {'checked': True, 'confirmed': changed, 'pending': len(waiting), 'reasons': waiting[:5]}
+
 
 def process_signal(action):
-    with SIGNAL_LOCK:
-        mode = store.get_mode()
-
-        if mode == "OFF":
-            return {
-                "status": "ignored",
-                "reason": "mode_off",
-            }
-
-        if action == "LONG":
-            if mode not in {"LONG_ONLY", "BOTH"}:
-                return {
-                    "status": "ignored",
-                    "reason": "long_not_allowed",
-                }
-
-            return open_trade("LONG")
-
-        if action == "SHORT":
-            if mode not in {"SHORT_ONLY", "BOTH"}:
-                return {
-                    "status": "ignored",
-                    "reason": "short_not_allowed",
-                }
-
-            return open_trade("SHORT")
-
-        if action == "XL":
-            return close_trade(
-                "LONG",
-                "tradingview_XL_3m",
-            )
-
-        if action == "XS":
-            return close_trade(
-                "SHORT",
-                "tradingview_XS_3m",
-            )
-
-        return {
-            "status": "ignored",
-            "reason": "unknown_signal",
-        }
+    mode = store.mode()
+    if mode == 'OFF':
+        return {'status': 'ignored', 'reason': 'mode_off'}
+    if action == 'XL':
+        return close_trade('LONG', 'tradingview_XL_3m')
+    if action == 'XS':
+        return close_trade('SHORT', 'tradingview_XS_3m')
+    if action == 'LONG' and mode in ('LONG_ONLY', 'BOTH'):
+        return open_trade('LONG')
+    if action == 'SHORT' and mode in ('SHORT_ONLY', 'BOTH'):
+        return open_trade('SHORT')
+    return {'status': 'ignored', 'reason': 'mode_disallows_entry'}
 
 
-# ============================================================
-# NORMALIZACIÓN DE OPERACIONES
-# ============================================================
+def normalize_trade(item):
+    t = dict(item)
+    side = str(t.get('side', '')).upper()
+    if side not in ('LONG', 'SHORT'):
+        raise ValueError('Dirección inválida')
+    t.setdefault('id', str(uuid.uuid4()))
+    t.setdefault('opened_at', now())
+    t.setdefault('closed_at', now())
+    t.setdefault('symbol', SYMBOL)
+    t.setdefault('source', 'MANUAL')
+    for key in ('entry_price', 'exit_price', 'quantity', 'margin_used', 'leverage', 'gross_pnl', 'total_fees', 'funding', 'risk_usd'):
+        t[key] = number(t.get(key))
+    t['net_pnl'] = number(t.get('net_pnl', t['gross_pnl'] - t['total_fees'] + t['funding']))
+    t['r_multiple'] = t['net_pnl'] / t['risk_usd'] if t['risk_usd'] else 0
+    t['price_move_pct'] = ((t['exit_price'] - t['entry_price']) / t['entry_price'] * 100 * (1 if side == 'LONG' else -1)) if t['entry_price'] and t['exit_price'] else 0
+    t['pnl_pending'] = bool(t.get('pnl_pending', False))
+    return t
 
-def normalize_trade(raw):
-    raw = dict(raw or {})
 
-    side = str(
-        raw.get("side", "")
-    ).upper()
-
-    if side in {"BUY", "L"}:
-        side = "LONG"
-
-    if side in {"SELL", "S"}:
-        side = "SHORT"
-
-    if side not in {"LONG", "SHORT"}:
-        raise ValueError(
-            "La operación necesita LONG o SHORT"
-        )
-
-    entry = fnum(
-        raw.get("entry_price", raw.get("entry"))
-    )
-
-    exit_price = fnum(
-        raw.get("exit_price", raw.get("exit"))
-    )
-
-    quantity = fnum(
-        raw.get("quantity", raw.get("qty"))
-    )
-
-    margin = fnum(
-        raw.get("margin_used", raw.get("margin"))
-    )
-
-    leverage = fnum(
-        raw.get("leverage", LEVERAGE)
-    )
-
-    fees = fnum(
-        raw.get("total_fees", raw.get("fees"))
-    )
-
-    funding = fnum(raw.get("funding"))
-    risk = fnum(raw.get("risk_usd", raw.get("risk")))
-
-    sign = 1 if side == "LONG" else -1
-
-    gross = raw.get("gross_pnl")
-
-    if gross is None:
-        gross = (
-            (exit_price - entry) * quantity * sign
-            if entry > 0 and exit_price > 0
-            else 0
-        )
-
-    gross = fnum(gross)
-
-    net = raw.get("net_pnl")
-
-    if net is None:
-        net = gross - fees - funding
-
-    net = fnum(net)
-
-    move_pct = (
-        (exit_price - entry) / entry * 100 * sign
-        if entry > 0 and exit_price > 0
-        else 0
-    )
-
+def summary(trades):
+    done = [t for t in trades if not t.get('pnl_pending')]
+    pnl = [number(t.get('net_pnl')) for t in done]
+    wins = [p for p in pnl if p > 0.000001]
+    losses = [p for p in pnl if p < -0.000001]
+    curve = [0.0]
+    peak = dd = 0.0
+    longest_win = longest_loss = win_streak = loss_streak = 0
+    for p in pnl:
+        curve.append(curve[-1] + p)
+        peak = max(peak, curve[-1]); dd = max(dd, peak - curve[-1])
+        win_streak = win_streak + 1 if p > 0.000001 else 0
+        loss_streak = loss_streak + 1 if p < -0.000001 else 0
+        longest_win = max(longest_win, win_streak); longest_loss = max(longest_loss, loss_streak)
+    longs = [t for t in done if t.get('side') == 'LONG']
+    shorts = [t for t in done if t.get('side') == 'SHORT']
     return {
-        **raw,
-        "id": str(raw.get("id") or uuid.uuid4()),
-        "opened_at": raw.get("opened_at") or utc_now(),
-        "closed_at": raw.get("closed_at") or utc_now(),
-        "side": side,
-        "symbol": raw.get("symbol") or BINGX_SYMBOL,
-        "entry_price": entry,
-        "exit_price": exit_price,
-        "quantity": quantity,
-        "margin_used": margin,
-        "leverage": leverage,
-        "gross_pnl": gross,
-        "total_fees": fees,
-        "funding": funding,
-        "net_pnl": net,
-        "risk_usd": risk,
-        "r_multiple": net / risk if risk > 0 else 0,
-        "price_move_pct": move_pct,
-        "pnl_pending": bool(raw.get("pnl_pending", False)),
-        "source": raw.get("source", "AUTO"),
-        "close_reason": raw.get("close_reason", ""),
+        'count': len(trades), 'confirmed': len(done), 'pending': len(trades) - len(done),
+        'wins': len(wins), 'losses': len(losses), 'be': len(done) - len(wins) - len(losses),
+        'winrate': 100 * len(wins) / len(done) if done else 0,
+        'net': sum(pnl), 'gross': sum(number(t.get('gross_pnl')) for t in done),
+        'fees': sum(number(t.get('total_fees')) for t in done),
+        'funding': sum(number(t.get('funding')) for t in done),
+        'pf': sum(wins) / abs(sum(losses)) if losses else (999 if wins else 0),
+        'max_dd': dd, 'curve': curve,
+        'long_count': len(longs), 'short_count': len(shorts),
+        'long_net': sum(number(t.get('net_pnl')) for t in longs),
+        'short_net': sum(number(t.get('net_pnl')) for t in shorts),
+        'best': max(pnl, default=0), 'worst': min(pnl, default=0),
+        'avg_win': sum(wins) / len(wins) if wins else 0,
+        'avg_loss': sum(losses) / len(losses) if losses else 0,
+        'max_win_streak': longest_win, 'max_loss_streak': longest_loss,
+        'r_total': sum(number(t.get('r_multiple')) for t in done),
     }
 
-
-# ============================================================
-# ESTADÍSTICAS
-# ============================================================
-
-def trade_summary(trades):
-    confirmed = [
-        t for t in trades
-        if not t.get("pnl_pending")
-    ]
-
-    pending = len(trades) - len(confirmed)
-
-    wins = [
-        t for t in confirmed
-        if fnum(t.get("net_pnl")) > 0.01
-    ]
-
-    losses = [
-        t for t in confirmed
-        if fnum(t.get("net_pnl")) < -0.01
-    ]
-
-    net = sum(
-        fnum(t.get("net_pnl"))
-        for t in confirmed
-    )
-
-    gross = sum(
-        fnum(t.get("gross_pnl"))
-        for t in confirmed
-    )
-
-    fees = sum(
-        fnum(t.get("total_fees"))
-        for t in confirmed
-    )
-
-    gains = sum(
-        fnum(t.get("net_pnl"))
-        for t in wins
-    )
-
-    losses_abs = abs(sum(
-        fnum(t.get("net_pnl"))
-        for t in losses
-    ))
-
-    running = 0
-    peak = 0
-    max_dd = 0
-    curve = [0]
-
-    for trade in confirmed:
-        running += fnum(trade.get("net_pnl"))
-        peak = max(peak, running)
-        max_dd = max(max_dd, peak - running)
-        curve.append(round(running, 8))
-
-    current_type = "—"
-    current_count = 0
-    max_wins = 0
-    max_losses = 0
-    win_run = 0
-    loss_run = 0
-
-    for trade in confirmed:
-        pnl = fnum(trade.get("net_pnl"))
-
-        if pnl > 0.01:
-            win_run += 1
-            loss_run = 0
-            max_wins = max(max_wins, win_run)
-        elif pnl < -0.01:
-            loss_run += 1
-            win_run = 0
-            max_losses = max(max_losses, loss_run)
-        else:
-            win_run = 0
-            loss_run = 0
-
-    for trade in reversed(confirmed):
-        pnl = fnum(trade.get("net_pnl"))
-
-        kind = (
-            "W" if pnl > 0.01
-            else "L" if pnl < -0.01
-            else "BE"
-        )
-
-        if current_type == "—":
-            current_type = kind
-            current_count = 1
-        elif kind == current_type:
-            current_count += 1
-        else:
-            break
-
-    base = 0
-
-    for trade in confirmed:
-        value = fnum(trade.get("balance_before"))
-
-        if value > 0:
-            base = value
-            break
-
-    longs = [
-        t for t in confirmed
-        if t.get("side") == "LONG"
-    ]
-
-    shorts = [
-        t for t in confirmed
-        if t.get("side") == "SHORT"
-    ]
-
-    values = [
-        fnum(t.get("net_pnl"))
-        for t in confirmed
-    ]
-
-    return {
-        "count": len(trades),
-        "confirmed": len(confirmed),
-        "pending": pending,
-        "wins": len(wins),
-        "losses": len(losses),
-        "be": len(confirmed) - len(wins) - len(losses),
-        "winrate": (
-            len(wins) / len(confirmed) * 100
-            if confirmed else 0
-        ),
-        "net": net,
-        "gross": gross,
-        "fees": fees,
-        "pf": (
-            gains / losses_abs
-            if losses_abs > 0
-            else 999 if gains > 0 else 0
-        ),
-        "max_dd": max_dd,
-        "net_pct": net / base * 100 if base > 0 else 0,
-        "max_dd_pct": (
-            max_dd / base * 100 if base > 0 else 0
-        ),
-        "curve": curve,
-        "streak_type": current_type,
-        "streak_count": current_count,
-        "streak_label": (
-            f"{current_count} "
-            + {
-                "W": "GANADAS",
-                "L": "PERDIDAS",
-                "BE": "BE",
-            }.get(current_type, "")
-            if current_type != "—" else "—"
-        ),
-        "max_win_streak": max_wins,
-        "max_loss_streak": max_losses,
-        "avg_win": gains / len(wins) if wins else 0,
-        "avg_loss": (
-            -losses_abs / len(losses)
-            if losses else 0
-        ),
-        "long_count": len(longs),
-        "short_count": len(shorts),
-        "long_net": sum(
-            fnum(t.get("net_pnl")) for t in longs
-        ),
-        "short_net": sum(
-            fnum(t.get("net_pnl")) for t in shorts
-        ),
-        "best_trade": max(values, default=0),
-        "worst_trade": min(values, default=0),
-        "r_global": sum(
-            fnum(t.get("r_multiple"))
-            for t in confirmed
-        ),
-    }
-
-
-# ============================================================
-# PANEL HTML
-# ============================================================
-
-PANEL_HTML = r"""
-<!doctype html>
-<html lang="es">
-<head>
-<meta charset="utf-8">
-<meta name="viewport"
-content="width=device-width,initial-scale=1">
-
+PANEL = r'''<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>BOT PETRÓLEO WTI 3M</title>
-
 <style>
-:root {
-    --bg:#05070a;
-    --card:#12161c;
-    --card2:#0c1016;
-    --line:#29313c;
-    --text:#f5f7fa;
-    --muted:#94a0af;
-    --green:#00df87;
-    --red:#ff4963;
-    --blue:#357df6;
-    --gold:#c99a08;
-}
-
-* {box-sizing:border-box}
-
-body {
-    margin:0;
-    background:var(--bg);
-    color:var(--text);
-    font-family:-apple-system,BlinkMacSystemFont,
-                "Segoe UI",sans-serif;
-}
-
-main {
-    max-width:1050px;
-    margin:auto;
-    padding:16px;
-}
-
-h1 {
-    text-align:center;
-    font-size:35px;
-    margin:20px 0 8px;
-}
-
-.center {text-align:center}
-.muted {color:var(--muted)}
-.good {color:var(--green)}
-.bad {color:var(--red)}
-.warn {color:#ffd166}
-
-.card {
-    background:var(--card);
-    border:1px solid var(--line);
-    border-radius:24px;
-    padding:22px;
-    margin:18px 0;
-}
-
-.mode {
-    text-align:center;
-    color:var(--green);
-    font-size:42px;
-    font-weight:900;
-    margin:12px 0;
-}
-
-.grid {
-    display:grid;
-    grid-template-columns:1fr 1fr;
-    gap:12px;
-}
-
-.stats {
-    display:grid;
-    grid-template-columns:repeat(4,1fr);
-    gap:12px;
-}
-
-.stat {
-    background:var(--card2);
-    border:1px solid var(--line);
-    border-radius:17px;
-    padding:16px;
-}
-
-.stat small {
-    color:var(--muted);
-    display:block;
-}
-
-.stat strong {
-    display:block;
-    font-size:26px;
-    margin-top:8px;
-}
-
-.btn,button {
-    display:block;
-    width:100%;
-    border:0;
-    border-radius:16px;
-    padding:18px 12px;
-    color:white;
-    text-decoration:none;
-    font-size:17px;
-    font-weight:800;
-    text-align:center;
-    cursor:pointer;
-}
-
-.off {background:#68717f}
-.long {background:#07934f}
-.short {background:#bf233e}
-.close {background:#2769bd}
-.both {background:#bd9009}
-.blue {background:var(--blue)}
-.dark {background:#303640}
-
-input,select {
-    width:100%;
-    padding:14px;
-    border-radius:12px;
-    border:1px solid var(--line);
-    background:#0b0e12;
-    color:white;
-    font-size:15px;
-}
-
-table {
-    width:100%;
-    border-collapse:collapse;
-    font-size:12px;
-}
-
-th,td {
-    padding:10px;
-    border-bottom:1px solid var(--line);
-    text-align:left;
-    white-space:nowrap;
-}
-
-.scroll {overflow:auto}
-
-.event {
-    background:#0b0e12;
-    border:1px solid var(--line);
-    border-radius:12px;
-    padding:11px;
-    margin:8px 0;
-    font-size:12px;
-    overflow-wrap:anywhere;
-}
-
-.tag {
-    display:inline-block;
-    padding:5px 9px;
-    border-radius:20px;
-    background:#202630;
-}
-
-#curve {
-    display:block;
-    width:100%;
-    height:250px;
-    background:#090d12;
-    border-radius:18px;
-}
-
-@media(max-width:850px) {
-    .stats {grid-template-columns:1fr 1fr}
-}
-
-@media(max-width:600px) {
-    h1 {font-size:29px}
-    main {padding:12px}
-    .mode {font-size:35px}
-    .stats {grid-template-columns:1fr 1fr}
-}
-</style>
-</head>
-
-<body>
-<main>
-
+:root{--bg:#070a0f;--panel:#151a21;--inner:#0e1218;--stroke:#2d3541;--white:#f4f7fa;--gray:#a3adbc;--green:#00d489;--red:#fc536b;--blue:#3977e9;--gold:#cfa01a}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--white);font:15px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+main{max-width:1100px;margin:auto;padding:16px}.center{text-align:center}.muted{color:var(--gray)}.green{color:var(--green)}.red{color:var(--red)}.yellow{color:#ffcd6e}
+h1{text-align:center;font-size:32px}h2{margin:0 0 18px;font-size:19px}section{margin:18px 0}
+.card{background:var(--panel);border:1px solid var(--stroke);padding:21px;border-radius:23px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+.stat{background:var(--inner);border:1px solid var(--stroke);border-radius:15px;padding:14px;overflow-wrap:anywhere}.stat small{display:block;color:var(--gray)}.stat strong{display:block;margin-top:7px;font-size:25px}
+.mode{font-size:38px;font-weight:900;color:var(--green);margin:18px auto}.btn,button{border:0;border-radius:14px;color:white;font-size:16px;font-weight:750;padding:16px 12px;display:block;text-align:center;width:100%;text-decoration:none;cursor:pointer}
+.off{background:#606b79}.long{background:#048856}.short{background:#bf2945}.close{background:#3265b9}.both{background:#b38a0d}.blue{background:var(--blue)}.dark{background:#343c48}
+input,select{width:100%;min-width:0;border:1px solid var(--stroke);background:#0c1116;color:white;padding:13px;border-radius:12px;font-size:15px}
+table{border-collapse:collapse;width:100%;font-size:12px}th,td{border-bottom:1px solid var(--stroke);padding:11px 9px;text-align:left;white-space:nowrap}.scroll{overflow:auto}.event{background:#0c1116;border:1px solid var(--stroke);padding:12px;border-radius:12px;margin:7px 0;overflow-wrap:anywhere;font-size:12px}
+#curve{display:block;width:100%;height:240px;background:#080c12;border-radius:14px}
+@media(max-width:800px){.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:500px){h1{font-size:25px}.card{padding:16px}.stat strong{font-size:21px}}
+</style></head><body><main>
 <h1>🛢 BOT PETRÓLEO WTI 3M</h1>
-
-<p class="center muted">
-{{symbol}} · 3M · {{leverage}}x ·
-ISOLATED ·
-{{'%.1f'|format(balance_percent)}}% del balance · REAL
-</p>
-
-<section class="card">
-    <p class="center muted">MODO ACTUAL</p>
-    <div class="mode">
-        {{'LONG + SHORT' if mode == 'BOTH' else mode}}
-    </div>
-</section>
-
+<p class="center muted">{{symbol}} · 3M · {{leverage}}x · ISOLATED · {{percent}}% del balance · REAL</p>
+<section class="card center"><span class="muted">MODO ACTUAL</span><div class="mode">{{mode}}</div></section>
 <section class="grid">
-
-<form method="post"
-action="/setmode/OFF?secret={{secret}}">
-<button class="off">OFF</button>
-</form>
-
-<form method="post"
-action="/setmode/LONG_ONLY?secret={{secret}}">
-<button class="long">SOLO LONG</button>
-</form>
-
-<form method="post"
-action="/setmode/SHORT_ONLY?secret={{secret}}">
-<button class="short">SOLO SHORT</button>
-</form>
-
-<form method="post"
-action="/setmode/CLOSE_ONLY?secret={{secret}}">
-<button class="close">SOLO CERRAR</button>
-</form>
-
-<form method="post"
-action="/setmode/BOTH?secret={{secret}}">
-<button class="both">LONG + SHORT</button>
-</form>
-
-<a class="btn blue"
-href="/diagnostic?secret={{secret}}">
-PROBAR BINGX
-</a>
-
+{% for code,label,style in modes %}<form method="post" action="/setmode/{{code}}?secret={{secret}}"><button class="{{style}}">{{label}}</button></form>{% endfor %}
+<a class="btn blue" href="/diagnostic?secret={{secret}}">PROBAR BINGX</a>
+<form method="post" action="/sync?secret={{secret}}"><button class="blue">SINCRONIZAR</button></form>
+<form method="post" action="/reconcile?secret={{secret}}"><button class="both">ACTUALIZAR PNL REAL</button></form>
 </section>
-
-<section class="card">
-
-<div class="grid">
-<h2>Posición real BingX</h2>
-
-<form method="post"
-action="/sync?secret={{secret}}">
-<button class="blue">SINCRONIZAR</button>
-</form>
-</div>
-
-{% if warning %}
-<p class="warn">{{warning}}</p>
-{% endif %}
-
-{% if live %}
-<h2 class="good">
-{{live.side}} · {{live.quantity}} contratos
-</h2>
-
-<p>
-Entrada: {{live.entry_price}} ·
-{{live.leverage}}x ·
-PnL flotante:
-{{'%.4f'|format(live.unrealized_pnl)}} USDT
-</p>
-{% else %}
-<p class="center muted">
-FLAT · Sin posición WTI abierta
-</p>
-{% endif %}
-
+<section class="card"><h2>Posición real en BingX</h2>
+{% if warning %}<p class="yellow">{{warning}}</p>{% endif %}
+{% if live %}<h2 class="{{'green' if live.side=='LONG' else 'red'}}">{{live.side}} · {{live.quantity}} contratos</h2>
+<p>Entrada: {{live.entry_price}} · Apalancamiento: {{live.leverage}}x · PnL flotante: {{'%.4f'|format(live.unrealized_pnl)}} USDT</p>
+{% elif not warning %}<p class="muted">FLAT · Sin posición WTI abierta</p>{% endif %}</section>
+<section class="card"><h2>Curva de rendimiento confirmado</h2>
+<h1 class="{{'green' if stats.net>=0 else 'red'}}">{{'%+.4f'|format(stats.net)}} USDT</h1>
+<svg id="curve" viewBox="0 0 1000 260" preserveAspectRatio="none"></svg>
 </section>
-
-<section class="card">
-
-<h2>Curva de rendimiento</h2>
-
-<h1 class="{{'good' if stats.net >= 0 else 'bad'}}">
-${{'%.2f'|format(stats.net)}}
-</h1>
-
-<p class="muted">
-PnL confirmado ·
-{{'%+.2f'|format(stats.net_pct)}}%
-</p>
-
-<svg id="curve"
-viewBox="0 0 1000 260"
-preserveAspectRatio="none"></svg>
-
-</section>
-
-<section class="card">
-
-<h2>Estadísticas</h2>
-
-<div class="stats">
-
-{% for label,value in cards %}
-<div class="stat">
-<small>{{label}}</small>
-<strong>{{value}}</strong>
-</div>
-{% endfor %}
-
-</div>
-
-{% if stats.pending %}
-<p class="warn">
-{{stats.pending}} operaciones con PnL
-pendiente de conciliación.
-</p>
-{% endif %}
-
-</section>
-
-<section class="card">
-
-<h2>Agregar operación manual</h2>
-
-<form class="grid" method="post"
-action="/manual-trade?secret={{secret}}">
-
-<select name="side">
-<option>LONG</option>
-<option>SHORT</option>
-</select>
-
-<input name="entry_price"
-type="number" step="any"
-placeholder="Precio entrada" required>
-
-<input name="exit_price"
-type="number" step="any"
-placeholder="Precio salida" required>
-
-<input name="quantity"
-type="number" step="any"
-placeholder="Cantidad contratos">
-
-<input name="margin_used"
-type="number" step="any"
-placeholder="Margen USDT">
-
-<input name="risk_usd"
-type="number" step="any"
-placeholder="Riesgo USDT">
-
-<input name="gross_pnl"
-type="number" step="any"
-placeholder="PnL bruto real">
-
-<input name="net_pnl"
-type="number" step="any"
-placeholder="PnL neto real">
-
-<input name="fees"
-type="number" step="any"
-placeholder="Comisiones">
-
-<input name="funding"
-type="number" step="any"
-placeholder="Funding">
-
-<input name="opened_at"
-type="datetime-local">
-
-<input name="closed_at"
-type="datetime-local">
-
-<input name="notes"
-placeholder="Notas">
-
-<button class="long">AGREGAR</button>
-
-</form>
-</section>
-
-<section class="card">
-
-<h2>Importar historial JSON</h2>
-
-<form class="grid"
-method="post"
-enctype="multipart/form-data"
-action="/import-json?secret={{secret}}">
-
-<input type="file" name="file"
-accept=".json,application/json" required>
-
-<select name="mode">
-<option value="append">AGREGAR</option>
-<option value="replace">REEMPLAZAR</option>
-</select>
-
-<button class="blue">IMPORTAR</button>
-
-</form>
-</section>
-
-<section class="grid">
-
-<a class="btn dark"
-href="/download?secret={{secret}}">
-DESCARGAR CSV
-</a>
-
-<a class="btn dark"
-href="/export-json?secret={{secret}}">
-EXPORTAR JSON
-</a>
-
-</section>
-
-<section class="card scroll">
-
-<h2>Historial de operaciones</h2>
-
-<table>
-<thead>
-<tr>
-<th>Cierre</th>
-<th>Lado</th>
-<th>Origen</th>
-<th>Entrada</th>
-<th>Salida</th>
-<th>Movimiento</th>
-<th>Margen</th>
-<th>Fees</th>
-<th>PnL neto</th>
-<th>R</th>
-<th>Motivo</th>
-</tr>
-</thead>
-
-<tbody>
-
-{% for t in trades %}
-<tr>
-
-<td>{{t.closed_at[:19]}}</td>
-<td>{{t.side}}</td>
-
-<td>
-<span class="tag">{{t.source}}</span>
-</td>
-
+<section class="card"><h2>Estadísticas · Histórico WTI</h2>
+<div class="stats">{% for label,value in cards %}<div class="stat"><small>{{label}}</small><strong>{{value}}</strong></div>{% endfor %}</div>
+{% if stats.pending %}<p class="yellow">{{stats.pending}} operación(es) pendientes de datos confirmados por BingX. Puedes tocar ACTUALIZAR PNL REAL.</p>{% endif %}</section>
+<section class="card"><h2>Agregar operación manual</h2>
+<form class="grid" method="post" action="/manual-trade?secret={{secret}}">
+<select name="side"><option>LONG</option><option>SHORT</option></select>
+<input name="entry_price" type="number" step="any" placeholder="Precio de entrada" required>
+<input name="exit_price" type="number" step="any" placeholder="Precio de cierre" required>
+<input name="quantity" type="number" step="any" placeholder="Cantidad">
+<input name="margin_used" type="number" step="any" placeholder="Margen en USDT">
+<input name="gross_pnl" type="number" step="any" placeholder="PnL bruto real">
+<input name="net_pnl" type="number" step="any" placeholder="PnL neto real">
+<input name="fees" type="number" step="any" placeholder="Comisiones">
+<input name="funding" type="number" step="any" placeholder="Funding firmado">
+<input name="risk_usd" type="number" step="any" placeholder="Riesgo en USDT">
+<input name="opened_at" type="datetime-local"><input name="closed_at" type="datetime-local">
+<input name="notes" placeholder="Notas"><button class="long">AGREGAR OPERACIÓN</button>
+</form></section>
+<section class="card"><h2>Importar historial JSON</h2>
+<form class="grid" method="post" enctype="multipart/form-data" action="/import-json?secret={{secret}}">
+<input type="file" name="file" accept=".json,application/json" required>
+<select name="mode"><option value="append">AGREGAR</option><option value="replace">REEMPLAZAR</option></select><button class="blue">IMPORTAR</button></form></section>
+<section class="grid"><a class="btn dark" href="/download?secret={{secret}}">DESCARGAR CSV</a><a class="btn dark" href="/export-json?secret={{secret}}">EXPORTAR JSON</a></section>
+<section class="card scroll"><h2>Historial de operaciones</h2>
+<table><thead><tr><th>Cierre</th><th>Dirección</th><th>Origen</th><th>Entrada</th><th>Salida</th><th>Movimiento</th><th>Margen</th><th>Comisiones</th><th>Funding</th><th>PnL neto</th><th>R</th><th>Motivo</th></tr></thead>
+<tbody>{% for t in trades %}<tr>
+<td>{{t.closed_at[:19]}}</td><td>{{t.side}}</td><td>{{t.source}}</td>
 <td>{{'%.4f'|format(t.entry_price)}}</td>
-
-<td>
-{{'%.4f'|format(t.exit_price)
-if t.exit_price else 'Pendiente'}}
-</td>
-
-<td>
-{{'%.3f'|format(t.price_move_pct)}}%
-</td>
-
-<td>
-${{'%.2f'|format(t.margin_used)}}
-</td>
-
-<td>
-${{'%.2f'|format(t.total_fees)}}
-</td>
-
-<td class="{{'good' if t.net_pnl >= 0 else 'bad'}}">
-{{'Pendiente' if t.pnl_pending
-else '$%.2f'|format(t.net_pnl)}}
-</td>
-
-<td>{{'%.2f'|format(t.r_multiple)}}R</td>
-<td>{{t.close_reason}}</td>
-
-</tr>
-{% else %}
-<tr>
-<td colspan="11" class="center muted">
-Todavía no hay operaciones.
-</td>
-</tr>
-{% endfor %}
-
-</tbody>
-</table>
-
-</section>
-
-<section class="card">
-
-<h2>Últimos eventos</h2>
-
-{% for e in events %}
-<div class="event">
-{{e.time[:19].replace('T',' ')}}
-· {{e.kind}} · {{e.detail}}
-</div>
-{% else %}
-<p class="muted">Todavía no hay eventos.</p>
-{% endfor %}
-
-</section>
-
-</main>
-
-<script>
-const values = {{stats.curve|tojson}};
-const svg = document.getElementById("curve");
-
-function drawCurve() {
-    if (!svg || !values.length) return;
-
-    const W = 1000;
-    const H = 260;
-    const px = 24;
-    const py = 28;
-
-    const minVal = Math.min(0,...values);
-    const maxVal = Math.max(0,...values);
-    const span = maxVal - minVal || 1;
-
-    const x = i =>
-        values.length === 1
-        ? W/2
-        : px + i/(values.length-1)*(W-2*px);
-
-    const y = v =>
-        H-py-(v-minVal)/span*(H-2*py);
-
-    const points = values.map(
-        (v,i) => `${x(i)},${y(v)}`
-    ).join(" ");
-
-    const last = values[values.length-1];
-    const color = last >= 0 ? "#00df87" : "#ff4963";
-
-    svg.innerHTML = `
-        <line x1="${px}" y1="${y(0)}"
-        x2="${W-px}" y2="${y(0)}"
-        stroke="#38414c" stroke-width="2"
-        stroke-dasharray="7 7"/>
-
-        <polyline points="${points}"
-        fill="none" stroke="#ffffff"
-        stroke-width="4"
-        stroke-linejoin="round"/>
-
-        <circle cx="${x(values.length-1)}"
-        cy="${y(last)}" r="9"
-        fill="${color}" stroke="white"
-        stroke-width="3"/>
-    `;
-}
-
-drawCurve();
-</script>
-
-</body>
-</html>
-"""
+<td>{{'%.4f'|format(t.exit_price) if t.exit_price else 'Pendiente'}}</td>
+<td>{{'%.3f'|format(t.price_move_pct)}}%</td>
+<td>${{'%.2f'|format(t.margin_used)}}</td><td>${{'%.4f'|format(t.total_fees)}}</td><td>{{'%+.4f'|format(t.funding)}}</td>
+<td class="{{'green' if t.net_pnl>=0 else 'red'}}">{{'Pendiente' if t.pnl_pending else '%+.4f'|format(t.net_pnl)}}</td>
+<td>{{'%.2f'|format(t.r_multiple)}}R</td><td>{{t.close_reason}}</td></tr>
+{% else %}<tr><td colspan="12" class="muted">No hay operaciones registradas.</td></tr>{% endfor %}</tbody></table></section>
+<section class="card"><h2>Últimos eventos</h2>{% for e in events %}<div class="event">{{e.time[:19]}} · {{e.kind}} · {{e.detail}}</div>{% else %}<p class="muted">Sin eventos.</p>{% endfor %}</section>
+</main><script>
+const v={{stats.curve|tojson}};const s=document.getElementById('curve');
+if(v.length){const mn=Math.min(0,...v),mx=Math.max(0,...v),span=mx-mn||1;
+const x=i=>v.length==1?500:25+i/(v.length-1)*950;const y=p=>234-(p-mn)/span*204;
+const pts=v.map((p,i)=>`${x(i)},${y(p)}`).join(' ');
+s.innerHTML=`<line x1="25" y1="${y(0)}" x2="975" y2="${y(0)}" stroke="#38414c" stroke-dasharray="6 5"/><polyline points="${pts}" fill="none" stroke="#eef3fa" stroke-width="4"/>`;}
+</script></body></html>'''
 
 
-# ============================================================
-# AUTORIZACIÓN
-# ============================================================
-
-def control_authorized():
-    return secret_matches(
-        request.args.get("secret", ""),
-        CONTROL_SECRET,
-    )
+def panel_authorized():
+    return auth(request.args.get('secret'), CONTROL_SECRET)
 
 
-# ============================================================
-# HOME
-# ============================================================
-
-@app.get("/")
-def home():
-    return (
-        f"{BOT_NAME} | "
-        f"SYMBOL={BINGX_SYMBOL} | "
-        f"MODE={store.get_mode()} | "
-        "REAL",
-        200,
-    )
+@app.get('/')
+def root():
+    return f'{BOT_NAME} | {SYMBOL} | MODE={store.mode()} | REAL', 200
 
 
-# ============================================================
-# HEALTH
-# ============================================================
-
-@app.get("/health")
+@app.get('/health')
 def health():
-    return jsonify({
-        "status": "ok",
-        "bot": BOT_NAME,
-        "real_trading": True,
-        "symbol": BINGX_SYMBOL,
-        "timeframe": "3m",
-        "leverage": LEVERAGE,
-        "balance_percent": BALANCE_PERCENT,
-        "position_mode": POSITION_MODE,
-        "mode": store.get_mode(),
-        "tv_symbols": sorted(TV_SYMBOLS),
-        "state_prefix": STATE_PREFIX,
-        "redis": store.redis_enabled,
-        "version": "oil-four-alerts-v1",
-    })
+    return jsonify({'ok': True, 'bot': BOT_NAME, 'symbol': SYMBOL, 'mode': store.mode(), 'timeframe': '3m', 'state_prefix': STATE_PREFIX, 'redis': store.redis, 'version': 'WTI-REAL-PNL-2'})
 
 
-# ============================================================
-# PANEL
-# ============================================================
-
-@app.get("/control")
+@app.get('/control')
 def control():
-    if not control_authorized():
-        return "Clave de panel inválida", 403
-
+    if not panel_authorized():
+        return 'Acceso denegado', 403
+    warning = ''
     live = None
-    warning = ""
-
     try:
-        sync = sync_position()
-
-        if sync.get("reason") == "multiple_positions":
-            warning = (
-                "Hay varias posiciones WTI abiertas. "
-                "Revisar BingX."
-            )
-        else:
-            live = sync.get("position")
-
+        live = sync_position()
     except Exception as exc:
-        warning = (
-            "Error sincronizando BingX: "
-            + redact_error(exc)
-        )
-
-    trades = store.get_trades()
-    stats = trade_summary(trades)
-
+        warning = 'Error consultando posición: ' + safe_error(exc)
+    try:
+        reconcile_pending()
+    except Exception as exc:
+        store.event('PNL_ERROR', safe_error(exc))
+        warning += ' · PnL: ' + safe_error(exc)
+    trades = store.trades()
+    stats = summary(trades)
     cards = [
-        ("Operaciones", stats["count"]),
-        ("Confirmadas", stats["confirmed"]),
-        ("Pendientes", stats["pending"]),
-        ("Ganadas", stats["wins"]),
-        ("Perdidas", stats["losses"]),
-        ("Winrate", f"{stats['winrate']:.1f}%"),
-        ("Profit Factor", f"{stats['pf']:.2f}"),
-        ("PnL neto", f"${stats['net']:.2f}"),
-        ("PnL %", f"{stats['net_pct']:+.2f}%"),
-        ("Fees", f"${stats['fees']:.2f}"),
-        ("Max DD", f"${stats['max_dd']:.2f}"),
-        ("Max DD %", f"{stats['max_dd_pct']:.2f}%"),
-        ("R global", f"{stats['r_global']:.2f}R"),
-        ("Racha actual", stats["streak_label"]),
-        ("Mejor racha W", stats["max_win_streak"]),
-        ("Peor racha L", stats["max_loss_streak"]),
-        ("Promedio W", f"${stats['avg_win']:.2f}"),
-        ("Promedio L", f"${stats['avg_loss']:.2f}"),
-        ("LONG", stats["long_count"]),
-        ("SHORT", stats["short_count"]),
-        ("PnL LONG", f"${stats['long_net']:.2f}"),
-        ("PnL SHORT", f"${stats['short_net']:.2f}"),
-        ("Mejor operación", f"${stats['best_trade']:.2f}"),
-        ("Peor operación", f"${stats['worst_trade']:.2f}"),
+        ('Operaciones', stats['count']), ('Confirmadas', stats['confirmed']), ('Pendientes', stats['pending']),
+        ('Ganadas', stats['wins']), ('Perdidas', stats['losses']), ('Winrate', f"{stats['winrate']:.1f}%"),
+        ('Profit Factor', f"{stats['pf']:.2f}"), ('PnL neto', f"${stats['net']:+.4f}"),
+        ('PnL bruto', f"${stats['gross']:+.4f}"), ('Comisiones', f"${stats['fees']:.4f}"),
+        ('Funding', f"${stats['funding']:+.4f}"), ('Máx. DD', f"${stats['max_dd']:.4f}"),
+        ('LONG', stats['long_count']), ('SHORT', stats['short_count']),
+        ('PnL LONG', f"${stats['long_net']:+.4f}"), ('PnL SHORT', f"${stats['short_net']:+.4f}"),
+        ('Mejor trade', f"${stats['best']:+.4f}"), ('Peor trade', f"${stats['worst']:+.4f}"),
+        ('Promedio W', f"${stats['avg_win']:+.4f}"), ('Promedio L', f"${stats['avg_loss']:+.4f}"),
+        ('Mejor racha W', stats['max_win_streak']), ('Peor racha L', stats['max_loss_streak']),
+        ('R global', f"{stats['r_total']:.2f}R"),
     ]
-
-    return render_template_string(
-        PANEL_HTML,
-        secret=request.args["secret"],
-        symbol=BINGX_SYMBOL,
-        leverage=LEVERAGE,
-        balance_percent=BALANCE_PERCENT,
-        mode=store.get_mode(),
-        live=live,
-        warning=warning,
-        trades=list(reversed(trades)),
-        stats=stats,
-        cards=cards,
-        events=list(reversed(store.get_events()[-15:])),
-    )
+    normalized = [normalize_trade(t) for t in reversed(trades)]
+    return render_template_string(PANEL, secret=request.args['secret'], symbol=SYMBOL, mode=store.mode(), leverage=LEVERAGE, percent=BALANCE_PERCENT, warning=warning, live=live, modes=[('OFF', 'OFF', 'off'), ('LONG_ONLY', 'SOLO LONG', 'long'), ('SHORT_ONLY', 'SOLO SHORT', 'short'), ('CLOSE_ONLY', 'SOLO CERRAR', 'close'), ('BOTH', 'LONG + SHORT', 'both')], stats=stats, cards=cards, trades=normalized, events=list(reversed(store.get('events', [])[-15:])))
 
 
-# ============================================================
-# CAMBIAR MODO
-# ============================================================
-
-@app.post("/setmode/<mode>")
-def set_mode(mode):
-    if not control_authorized():
-        return "Clave de panel inválida", 403
-
+@app.post('/setmode/<mode>')
+def setmode(mode):
+    if not panel_authorized():
+        return 'No autorizado', 403
     mode = mode.upper()
-
-    if mode not in VALID_MODES:
-        return jsonify({"error": "Modo inválido"}), 400
-
-    with SIGNAL_LOCK:
-        store.set_mode(mode)
-
-    store.add_event(
-        "MODE",
-        f"Modo cambiado a {mode}",
-    )
-
-    notify(
-        f"{BOT_NAME}: modo cambiado a {mode}"
-    )
-
-    return redirect(
-        "/control?secret=" + request.args["secret"]
-    )
+    if mode not in MODES:
+        return 'Modo no válido', 400
+    with LOCK:
+        store.set('mode', {'mode': mode, 'updated_at': now()})
+    store.event('MODE', f'Modo cambiado a {mode}')
+    telegram(f'{BOT_NAME}\nModo: {mode}')
+    return redirect('/control?secret=' + request.args['secret'])
 
 
-# ============================================================
-# SINCRONIZACIÓN MANUAL
-# ============================================================
-
-@app.post("/sync")
-def sync_route():
-    if not control_authorized():
-        return "Clave de panel inválida", 403
-
+@app.post('/sync')
+def sync():
+    if not panel_authorized():
+        return 'No autorizado', 403
     try:
-        result = sync_position()
-
-        store.add_event(
-            "SYNC",
-            json.dumps(result, ensure_ascii=False)[:800],
-        )
-
+        store.event('SYNC', json.dumps(sync_position(), ensure_ascii=False)[:400])
     except Exception as exc:
-        store.add_event(
-            "SYNC_ERROR",
-            redact_error(exc),
-        )
-
-    return redirect(
-        "/control?secret=" + request.args["secret"]
-    )
+        store.event('SYNC_ERROR', safe_error(exc))
+    return redirect('/control?secret=' + request.args['secret'])
 
 
-# ============================================================
-# DIAGNÓSTICO
-# ============================================================
+@app.post('/reconcile')
+def reconcile_route():
+    if not panel_authorized():
+        return 'No autorizado', 403
+    try:
+        result = reconcile_pending(force=True)
+        store.event('PNL_CHECK', f"Confirmadas {result.get('confirmed', 0)}, pendientes {result.get('pending', 0)}; {result.get('reasons', [])[:1]}")
+    except Exception as exc:
+        store.event('PNL_ERROR', safe_error(exc))
+    return redirect('/control?secret=' + request.args['secret'])
 
-@app.get("/diagnostic")
+
+@app.get('/diagnostic')
 def diagnostic():
-    if not control_authorized():
-        return jsonify({
-            "error": "No autorizado"
-        }), 403
-
-    checks = {
-        "time": utc_now(),
-        "bot": BOT_NAME,
-        "symbol": BINGX_SYMBOL,
-        "mode": store.get_mode(),
-        "real_trading": True,
-    }
-
+    if not panel_authorized():
+        return jsonify({'error': 'No autorizado'}), 403
+    result = {'bot': BOT_NAME, 'symbol': SYMBOL, 'mode': store.mode(), 'real_trading': True, 'time': now()}
     try:
-        checks["price"] = bingx.price()
-        checks["contract"] = bingx.contract_rules()
-        checks["balance_available_usdt"] = (
-            bingx.available_balance()
-        )
-        checks["positions"] = bingx.positions()
-        checks["hedge_mode"] = (
-            bingx.position_mode_is_hedge()
-        )
-        checks["margin_type"] = bingx.margin_type()
-
-        try:
-            checks["calculated_order"] = bingx.quantity()
-        except Exception as exc:
-            checks["calculated_order_error"] = (
-                redact_error(exc)
-            )
-
-        checks["status"] = "ok"
-
-        store.add_event(
-            "DIAGNOSTIC_OK",
-            "Conexión BingX comprobada",
-        )
-
-        return jsonify(checks)
-
+        result.update({'price': bingx.price(), 'contract': bingx.contract(), 'balance_available_usdt': bingx.balance(), 'positions': bingx.positions(), 'hedge_mode': bingx.hedge(), 'margin_type': bingx.margin_type(), 'status': 'ok'})
     except Exception as exc:
-        message = redact_error(exc)
-
-        store.add_event(
-            "DIAGNOSTIC_ERROR",
-            message,
-        )
-
-        return jsonify({
-            **checks,
-            "status": "error",
-            "error": message,
-        }), 500
+        result['status'] = 'error'
+        result['error'] = safe_error(exc)
+        store.event('DIAGNOSTIC_ERROR', result['error'])
+        return jsonify(result), 500
+    store.event('DIAGNOSTIC_OK', 'Conexión BingX comprobada')
+    return jsonify(result)
 
 
-# ============================================================
-# OPERACIÓN MANUAL
-# ============================================================
-
-@app.post("/manual-trade")
+@app.post('/manual-trade')
 def manual_trade():
-    if not control_authorized():
-        return "Clave de panel inválida", 403
-
-    raw = {
-        "id": str(uuid.uuid4()),
-        "opened_at": (
-            request.form.get("opened_at") or utc_now()
-        ),
-        "closed_at": (
-            request.form.get("closed_at") or utc_now()
-        ),
-        "side": request.form.get("side", "LONG"),
-        "symbol": BINGX_SYMBOL,
-        "entry_price": fnum(
-            request.form.get("entry_price")
-        ),
-        "exit_price": fnum(
-            request.form.get("exit_price")
-        ),
-        "quantity": fnum(
-            request.form.get("quantity")
-        ),
-        "margin_used": fnum(
-            request.form.get("margin_used")
-        ),
-        "risk_usd": fnum(
-            request.form.get("risk_usd")
-        ),
-        "fees": fnum(
-            request.form.get("fees")
-        ),
-        "funding": fnum(
-            request.form.get("funding")
-        ),
-        "leverage": LEVERAGE,
-        "source": "MANUAL",
-        "notes": request.form.get("notes", ""),
-        "close_reason": "manual_panel",
-    }
-
-    for field in ["gross_pnl", "net_pnl"]:
-        value = request.form.get(field)
-
-        if value not in {None, ""}:
-            raw[field] = fnum(value)
-
-    store.append_trade(normalize_trade(raw))
-
-    return redirect(
-        "/control?secret=" + request.args["secret"]
-    )
+    if not panel_authorized():
+        return 'No autorizado', 403
+    form = request.form
+    if form.get('net_pnl', '') == '' and form.get('gross_pnl', '') == '':
+        return 'Indica PnL real bruto o neto', 400
+    data = {'id': str(uuid.uuid4()), 'opened_at': form.get('opened_at') or now(), 'closed_at': form.get('closed_at') or now(), 'side': form.get('side', 'LONG'), 'symbol': SYMBOL, 'entry_price': form.get('entry_price'), 'exit_price': form.get('exit_price'), 'quantity': form.get('quantity'), 'margin_used': form.get('margin_used'), 'gross_pnl': form.get('gross_pnl', 0), 'total_fees': form.get('fees', 0), 'funding': form.get('funding', 0), 'risk_usd': form.get('risk_usd', 0), 'leverage': LEVERAGE, 'source': 'MANUAL', 'close_reason': 'manual_panel', 'notes': form.get('notes', '')}
+    if form.get('net_pnl') not in (None, ''):
+        data['net_pnl'] = form['net_pnl']
+    store.append_trade(normalize_trade(data))
+    return redirect('/control?secret=' + request.args['secret'])
 
 
-# ============================================================
-# IMPORTAR JSON
-# ============================================================
-
-@app.post("/import-json")
+@app.post('/import-json')
 def import_json():
-    if not control_authorized():
-        return "Clave de panel inválida", 403
-
-    uploaded = request.files.get("file")
-
+    if not panel_authorized():
+        return 'No autorizado', 403
+    uploaded = request.files.get('file')
     if not uploaded:
-        return "Falta archivo JSON", 400
-
+        return 'Falta JSON', 400
     try:
-        payload = json.loads(
-            uploaded.read().decode("utf-8")
-        )
-
+        payload = json.loads(uploaded.read().decode('utf-8'))
         if isinstance(payload, dict):
-            incoming = payload.get("trades", [])
-        elif isinstance(payload, list):
-            incoming = payload
+            if payload.get('app') and payload['app'] != BOT_NAME:
+                return 'Este archivo corresponde a otro bot', 400
+            records = payload.get('trades', [])
         else:
-            return "Formato JSON inválido", 400
-
-        normalized = [
-            normalize_trade(item)
-            for item in incoming
-            if isinstance(item, dict)
-        ]
-
+            records = payload
+        if not isinstance(records, list):
+            raise ValueError('Se esperaba lista de operaciones')
+        incoming = []
+        for entry in records:
+            if str(entry.get('symbol', SYMBOL)).upper() != SYMBOL:
+                raise ValueError('No se permite historial de otro símbolo')
+            incoming.append(normalize_trade(entry))
     except Exception as exc:
-        return (
-            "JSON inválido: " + redact_error(exc),
-            400,
-        )
-
-    import_mode = request.form.get(
-        "mode", "append"
-    )
-
-    if import_mode == "replace":
-        store.set_trades(normalized)
-
-    else:
-        existing = store.get_trades()
-
-        ids = {
-            str(t.get("id"))
-            for t in existing
-            if t.get("id")
-        }
-
-        for trade in normalized:
-            if trade["id"] in ids:
-                continue
-
-            existing.append(trade)
-            ids.add(trade["id"])
-
-        store.set_trades(existing)
-
-    return redirect(
-        "/control?secret=" + request.args["secret"]
-    )
+        return 'JSON inválido: ' + safe_error(exc), 400
+    with LOCK:
+        current = [] if request.form.get('mode') == 'replace' else store.trades()
+        ids = {str(t.get('id')) for t in current}
+        for trade in incoming:
+            if str(trade['id']) not in ids:
+                current.append(trade)
+                ids.add(str(trade['id']))
+        store.set('trades', current)
+    return redirect('/control?secret=' + request.args['secret'])
 
 
-# ============================================================
-# EXPORTAR CSV
-# ============================================================
-
-@app.get("/download")
-def download():
-    if not control_authorized():
-        return "Clave de panel inválida", 403
-
-    fields = [
-        "id",
-        "opened_at",
-        "closed_at",
-        "side",
-        "symbol",
-        "entry_price",
-        "exit_price",
-        "quantity",
-        "leverage",
-        "margin_used",
-        "gross_pnl",
-        "total_fees",
-        "funding",
-        "net_pnl",
-        "pnl_pending",
-        "risk_usd",
-        "r_multiple",
-        "source",
-        "close_reason",
-    ]
-
-    output = io.StringIO()
-
-    writer = csv.DictWriter(
-        output,
-        fieldnames=fields,
-        extrasaction="ignore",
-    )
-
-    writer.writeheader()
-
-    for trade in store.get_trades():
-        writer.writerow(trade)
-
-    return send_file(
-        io.BytesIO(
-            output.getvalue().encode("utf-8")
-        ),
-        mimetype="text/csv",
-        as_attachment=True,
-        download_name="petroleo_wti_historial.csv",
-    )
-
-
-# ============================================================
-# EXPORTAR JSON
-# ============================================================
-
-@app.get("/export-json")
+@app.get('/export-json')
 def export_json():
-    if not control_authorized():
-        return "Clave de panel inválida", 403
-
-    raw = json.dumps(
-        {
-            "app": BOT_NAME,
-            "version": 1,
-            "exportedAt": utc_now(),
-            "trades": store.get_trades(),
-        },
-        ensure_ascii=False,
-        indent=2,
-    ).encode("utf-8")
-
-    return send_file(
-        io.BytesIO(raw),
-        mimetype="application/json",
-        as_attachment=True,
-        download_name="petroleo_wti_historial.json",
-    )
+    if not panel_authorized():
+        return 'No autorizado', 403
+    content = json.dumps({'app': BOT_NAME, 'version': 2, 'exportedAt': now(), 'trades': store.trades()}, ensure_ascii=False, indent=2).encode('utf-8')
+    return send_file(io.BytesIO(content), mimetype='application/json', as_attachment=True, download_name='wti_3m_historial.json')
 
 
-# ============================================================
-# WEBHOOK TRADINGVIEW
-# ============================================================
+@app.get('/download')
+def download():
+    if not panel_authorized():
+        return 'No autorizado', 403
+    cols = ['id', 'opened_at', 'closed_at', 'side', 'symbol', 'entry_price', 'exit_price', 'quantity', 'leverage', 'margin_used', 'gross_pnl', 'total_fees', 'funding', 'net_pnl', 'pnl_pending', 'risk_usd', 'r_multiple', 'source', 'close_reason', 'open_order_id', 'close_order_id']
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=cols, extrasaction='ignore')
+    writer.writeheader()
+    for row in store.trades():
+        writer.writerow(row)
+    return send_file(io.BytesIO(output.getvalue().encode('utf-8-sig')), mimetype='text/csv', as_attachment=True, download_name='wti_3m_historial.csv')
 
-@app.post("/webhook")
+
+@app.post('/webhook')
 def webhook():
-    payload = request.get_json(silent=True) or {}
-
+    payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
-        return jsonify({
-            "error": "JSON inválido"
-        }), 400
-
-    if not secret_matches(
-        payload.get("secret"),
-        WEBHOOK_SECRET,
-    ):
-        store.add_event(
-            "WEBHOOK_REJECTED",
-            "Clave inválida",
-        )
-
-        return jsonify({
-            "error": "Clave de webhook inválida"
-        }), 403
-
-    action = str(
-        payload.get("action")
-        or payload.get("side")
-        or ""
-    ).upper().strip()
-
-    symbol = str(
-        payload.get("symbol", "")
-    ).upper().strip()
-
-    timeframe = str(
-        payload.get("timeframe", "")
-    ).lower().strip()
-
-    if action not in {
-        "LONG",
-        "SHORT",
-        "XL",
-        "XS",
-    }:
-        return jsonify({
-            "error": "Usa LONG, SHORT, XL o XS"
-        }), 400
-
-    if (
-        symbol not in TV_SYMBOLS
-        and symbol != BINGX_SYMBOL
-    ):
-        return jsonify({
-            "error": "Símbolo WTI no permitido",
-            "received": symbol,
-            "allowed": sorted(TV_SYMBOLS),
-        }), 400
-
-    if timeframe not in {"3", "3m"}:
-        return jsonify({
-            "error": "Solo señales 3M",
-            "received": timeframe,
-        }), 400
-
-    signal_id = str(
-        payload.get("signal_id")
-        or payload.get("bar_time")
-        or ""
-    ).strip()
-
-    if signal_id:
-        signal_id = (
-            f"{symbol}:{timeframe}:"
-            f"{action}:{signal_id}"
-        )
-
-    logger.info(
-        "WEBHOOK: %s %s %s",
-        action,
-        symbol,
-        timeframe,
-    )
-
-    store.add_event(
-        "WEBHOOK_RECEIVED",
-        f"{action} {symbol} {timeframe}",
-    )
-
+        return jsonify({'error': 'JSON inválido'}), 400
+    if not auth(payload.get('secret'), WEBHOOK_SECRET):
+        return jsonify({'error': 'Clave webhook inválida'}), 403
+    action = str(payload.get('action') or payload.get('side') or '').upper().strip()
+    symbol = str(payload.get('symbol', '')).upper().strip()
+    timeframe = str(payload.get('timeframe', '')).lower().strip()
+    if action not in ('LONG', 'SHORT', 'XL', 'XS'):
+        return jsonify({'error': 'Usa LONG, SHORT, XL o XS'}), 400
+    if symbol not in TV_SYMBOLS and symbol != SYMBOL:
+        return jsonify({'error': 'Símbolo WTI no permitido', 'symbol': symbol}), 400
+    if timeframe not in ('3', '3m'):
+        return jsonify({'error': 'Temporalidad debe ser 3M'}), 400
+    stamp = str(payload.get('signal_id') or payload.get('bar_time') or '').strip()
+    signal = f'{symbol}:{timeframe}:{action}:{stamp}' if stamp else ''
+    store.event('WEBHOOK_RECEIVED', f'{action} {symbol} 3M')
     try:
-        with SIGNAL_LOCK:
-            if signal_id and store.signal_seen(signal_id):
-                return jsonify({
-                    "ok": True,
-                    "result": {
-                        "status": "ignored",
-                        "reason": "duplicate_signal",
-                    },
-                })
-
-            # Se registra antes de ejecutar para evitar
-            # que una alerta repetida mande otra orden.
-            if signal_id:
-                store.remember_signal(signal_id)
-
+        with LOCK:
+            if signal and store.seen(signal):
+                return jsonify({'ok': True, 'result': {'status': 'ignored', 'reason': 'duplicate_signal'}})
+            if signal:
+                store.remember(signal)
             result = process_signal(action)
-
-        store.add_event(
-            "WEBHOOK_PROCESSED",
-            json.dumps(
-                result,
-                ensure_ascii=False,
-            )[:1400],
-        )
-
-        return jsonify({
-            "ok": True,
-            "result": result,
-        })
-
+            store.event('WEBHOOK_PROCESSED', json.dumps(result, ensure_ascii=False)[:450])
+            return jsonify({'ok': True, 'result': result})
     except Exception as exc:
-        message = redact_error(exc)
-
-        logger.exception(
-            "ERROR procesando webhook"
-        )
-
-        store.add_event(
-            "WEBHOOK_ERROR",
-            message,
-        )
-
-        notify(
-            f"ERROR {BOT_NAME}\n{message}"
-        )
-
-        return jsonify({
-            "ok": False,
-            "error": message,
-        }), 500
+        message = safe_error(exc)
+        store.event('WEBHOOK_ERROR', message)
+        telegram(f'{BOT_NAME}\nERROR: {message}')
+        logger.exception('Webhook error')
+        return jsonify({'ok': False, 'error': message}), 500
 
 
-# ============================================================
-# MONITOR
-# ============================================================
-
-@app.get("/monitor")
+@app.get('/monitor')
 def monitor():
-    if not secret_matches(
-        request.args.get("token", ""),
-        MONITOR_SECRET,
-    ):
-        return jsonify({
-            "error": "No autorizado"
-        }), 401
-
+    if not auth(request.args.get('token'), MONITOR_SECRET):
+        return jsonify({'error': 'No autorizado'}), 403
     try:
-        sync = sync_position()
-
+        position = sync_position()
+        status = {'ok': True, 'position': position}
     except Exception as exc:
-        sync = {
-            "status": "error",
-            "error": redact_error(exc),
-        }
-
-    return jsonify({
-        "checked_at": utc_now(),
-        "bot": BOT_NAME,
-        "real_trading": True,
-        "mode": store.get_mode(),
-        "sync": sync,
-        "active_trade": store.get_active_trade(),
-        "stats_all": trade_summary(
-            store.get_trades()
-        ),
-        "events": store.get_events()[-10:],
-    })
+        status = {'ok': False, 'error': safe_error(exc)}
+    return jsonify({'time': now(), 'bot': BOT_NAME, 'mode': store.mode(), 'sync': status, 'active_trade': store.get('active_trade', None), 'stats': summary(store.trades()), 'events': store.get('events', [])[-10:]})
 
 
-# ============================================================
-# INICIO
-# ============================================================
-
-if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=int(
-            os.getenv("PORT", "10000")
-        ),
-    )
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', '10000')))
