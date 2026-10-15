@@ -1,4 +1,3 @@
-
 import csv
 import hashlib
 import hmac
@@ -16,112 +15,32 @@ from urllib.parse import urlencode
 import requests
 from flask import Flask, jsonify, redirect, render_template_string, request, send_file
 
-# ============================================================
-# BOT PETROLEO WTI 3M - BINGX - OPERACIONES REALES
-#
-# LONG  = ABRIR COMPRA
-# SHORT = ABRIR VENTA
-# XL    = CERRAR COMPRA
-# XS    = CERRAR VENTA
-#
-# SIN REVERSION AUTOMATICA
-# SIN SIMULACION
-# UN SOLO BOTON SINCRONIZAR: POSICION + PNL
-# ============================================================
-
-BOT_NAME = "BOT PETRÓLEO WTI 3M"
-BASE = "https://open-api.bingx.com"
-
-SYMBOL = os.getenv(
-    "BINGX_SYMBOL",
-    "NCCO1OILWTI2USD-USDT"
-).strip().upper()
-
-TV_SYMBOLS = {
-    s.strip().upper()
-    for s in os.getenv(
-        "TV_SYMBOLS",
-        "OILWTIUSDT.P,BINGX:OILWTIUSDT.P,"
-        "OILWTI-USDT,OILWTIUSDT"
-    ).split(",")
-    if s.strip()
-}
-
-API_KEY = os.getenv("BINGX_API_KEY", "").strip()
-
-API_SECRET = (
-    os.getenv("BINGX_API_SECRET", "")
-    or os.getenv("BINGX_SECRET_KEY", "")
-).strip()
-
-WEBHOOK_SECRET = os.getenv(
-    "WEBHOOK_SECRET", ""
-).strip()
-
-CONTROL_SECRET = os.getenv(
-    "CONTROL_SECRET", WEBHOOK_SECRET
-).strip()
-
-MONITOR_SECRET = os.getenv(
-    "MONITOR_SECRET", ""
-).strip()
-
-TG_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN", ""
-).strip()
-
-TG_CHAT = os.getenv(
-    "TELEGRAM_CHAT_ID", ""
-).strip()
-
-BALANCE_PERCENT = float(
-    os.getenv("BALANCE_PERCENT", "90")
-)
-
-LEVERAGE = int(
-    os.getenv("LEVERAGE", "2")
-)
-
-DATA_DIR = os.getenv("DATA_DIR", ".")
-
-REDIS_URL = os.getenv(
-    "UPSTASH_REDIS_REST_URL", ""
-).strip()
-
-REDIS_TOKEN = os.getenv(
-    "UPSTASH_REDIS_REST_TOKEN", ""
-).strip()
-
-# NO CAMBIAR: CONSERVA EL HISTORIAL DEL PETROLEO
-STATE_PREFIX = "bot_petroleo_wti_3m_v1"
-
-MODES = (
-    "OFF",
-    "LONG_ONLY",
-    "SHORT_ONLY",
-    "CLOSE_ONLY",
-    "BOTH",
-)
-
-MODE_LABELS = {
-    "OFF": "OFF",
-    "LONG_ONLY": "SOLO LONG",
-    "SHORT_ONLY": "SOLO SHORT",
-    "CLOSE_ONLY": "SOLO CERRAR",
-    "BOTH": "LONG + SHORT",
-}
-
+# BOT PETROLEO WTI 3 MIN - ORDENES REALES
+# SHORT/LONG: abren solo si FLAT. XL/XS: cierran el lado correspondiente.
+# Sin reversion automatica, sin TP/SL añadidos, sin simulacion.
+BOT_NAME = 'BOT PETRÓLEO WTI 3M'
+BASE = 'https://open-api.bingx.com'
+SYMBOL = os.getenv('BINGX_SYMBOL', 'NCCO1OILWTI2USD-USDT').strip().upper()
+TV_SYMBOLS = {s.strip().upper() for s in os.getenv('TV_SYMBOLS', 'OILWTIUSDT.P,BINGX:OILWTIUSDT.P,OILWTI-USDT,OILWTIUSDT').split(',') if s.strip()}
+API_KEY = os.getenv('BINGX_API_KEY', '').strip()
+API_SECRET = (os.getenv('BINGX_API_SECRET', '') or os.getenv('BINGX_SECRET_KEY', '')).strip()
+WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET', '').strip()
+CONTROL_SECRET = os.getenv('CONTROL_SECRET', WEBHOOK_SECRET).strip()
+MONITOR_SECRET = os.getenv('MONITOR_SECRET', '').strip()
+TG_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
+TG_CHAT = os.getenv('TELEGRAM_CHAT_ID', '').strip()
+BALANCE_PERCENT = float(os.getenv('BALANCE_PERCENT', '90'))
+LEVERAGE = int(os.getenv('LEVERAGE', '2'))
+DATA_DIR = os.getenv('DATA_DIR', '.')
+REDIS_URL = os.getenv('UPSTASH_REDIS_REST_URL', '').strip()
+REDIS_TOKEN = os.getenv('UPSTASH_REDIS_REST_TOKEN', '').strip()
+STATE_PREFIX = 'bot_petroleo_wti_3m_v1'  # No cambiar: preserva historial WTI.
+MODES = ('OFF', 'LONG_ONLY', 'SHORT_ONLY', 'CLOSE_ONLY', 'BOTH')
 LOCK = threading.RLock()
-
 app = Flask(__name__)
-
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("wti-3m")
+logger = logging.getLogger('wti-3m')
 
-
-# ============================================================
-# UTILIDADES
-# ============================================================
 
 def now():
     return datetime.now(timezone.utc).isoformat()
@@ -140,3499 +59,874 @@ def dec(x):
 
 def epoch_ms(value):
     if isinstance(value, (int, float)):
-        return int(
-            value if value > 10**12 else value * 1000
-        )
-
+        return int(value if value > 10**12 else value * 1000)
     try:
-        return int(
-            datetime.fromisoformat(
-                str(value).replace("Z", "+00:00")
-            ).timestamp() * 1000
-        )
+        return int(datetime.fromisoformat(str(value).replace('Z', '+00:00')).timestamp() * 1000)
     except (TypeError, ValueError):
         return 0
 
 
 def auth(value, expected):
-    return (
-        bool(value and expected)
-        and hmac.compare_digest(
-            str(value),
-            str(expected)
-        )
-    )
+    return bool(value and expected) and hmac.compare_digest(str(value), str(expected))
 
 
 def safe_error(message):
     text = str(message)
-
-    for key in (
-        API_KEY,
-        API_SECRET,
-        WEBHOOK_SECRET,
-        CONTROL_SECRET,
-        MONITOR_SECRET,
-        REDIS_TOKEN,
-        TG_TOKEN,
-    ):
+    for key in (API_KEY, API_SECRET, WEBHOOK_SECRET, CONTROL_SECRET, MONITOR_SECRET, REDIS_TOKEN, TG_TOKEN):
         if key:
-            text = text.replace(key, "***")
-
+            text = text.replace(key, '***')
     return text[:500]
 
 
 def telegram(message):
-    if not TG_TOKEN or not TG_CHAT:
-        return
+    if TG_TOKEN and TG_CHAT:
+        try:
+            requests.post(f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage', json={'chat_id': TG_CHAT, 'text': str(message)[:3900]}, timeout=8)
+        except requests.RequestException:
+            logger.exception('Telegram no disponible')
 
-    try:
-        requests.post(
-            (
-                "https://api.telegram.org/bot"
-                f"{TG_TOKEN}/sendMessage"
-            ),
-            json={
-                "chat_id": TG_CHAT,
-                "text": str(message)[:3900],
-            },
-            timeout=8,
-        )
-    except requests.RequestException:
-        logger.exception(
-            "Telegram no disponible"
-        )
-
-
-# ============================================================
-# ALMACENAMIENTO: UPSTASH O JSON LOCAL
-# ============================================================
 
 class Store:
-
     def __init__(self):
         os.makedirs(DATA_DIR, exist_ok=True)
         self.lock = threading.RLock()
 
     @property
     def redis(self):
-        return bool(
-            REDIS_URL and REDIS_TOKEN
-        )
+        return bool(REDIS_URL and REDIS_TOKEN)
 
     def cmd(self, args):
-        response = requests.post(
-            REDIS_URL.rstrip("/"),
-            headers={
-                "Authorization": f"Bearer {REDIS_TOKEN}"
-            },
-            json=args,
-            timeout=12,
-        )
-
+        response = requests.post(REDIS_URL.rstrip('/'), headers={'Authorization': f'Bearer {REDIS_TOKEN}'}, json=args, timeout=12)
         response.raise_for_status()
         result = response.json()
-
-        if result.get("error"):
-            raise RuntimeError(
-                "Upstash no pudo guardar o "
-                "recuperar los datos"
-            )
-
-        return result.get("result")
+        if result.get('error'):
+            raise RuntimeError('Upstash no pudo guardar o recuperar los datos')
+        return result.get('result')
 
     def get(self, name, default):
         with self.lock:
             if self.redis:
-                raw = self.cmd([
-                    "GET",
-                    f"{STATE_PREFIX}:{name}",
-                ])
-
-                return (
-                    json.loads(raw)
-                    if raw else default
-                )
-
-            path = os.path.join(
-                DATA_DIR,
-                f"{STATE_PREFIX}_{name}.json",
-            )
-
+                raw = self.cmd(['GET', f'{STATE_PREFIX}:{name}'])
+                return json.loads(raw) if raw else default
+            path = os.path.join(DATA_DIR, f'{STATE_PREFIX}_{name}.json')
             if not os.path.isfile(path):
                 return default
-
-            with open(
-                path, encoding="utf-8"
-            ) as handle:
+            with open(path, encoding='utf-8') as handle:
                 return json.load(handle)
 
     def set(self, name, value):
         with self.lock:
-            raw = json.dumps(
-                value,
-                ensure_ascii=False,
-            )
-
+            raw = json.dumps(value, ensure_ascii=False)
             if self.redis:
-                self.cmd([
-                    "SET",
-                    f"{STATE_PREFIX}:{name}",
-                    raw,
-                ])
-                return
-
-            path = os.path.join(
-                DATA_DIR,
-                f"{STATE_PREFIX}_{name}.json",
-            )
-
-            temp = path + ".tmp"
-
-            with open(
-                temp,
-                "w",
-                encoding="utf-8",
-            ) as handle:
-                handle.write(raw)
-
-            os.replace(temp, path)
+                self.cmd(['SET', f'{STATE_PREFIX}:{name}', raw])
+            else:
+                path = os.path.join(DATA_DIR, f'{STATE_PREFIX}_{name}.json')
+                temp = path + '.tmp'
+                with open(temp, 'w', encoding='utf-8') as handle:
+                    handle.write(raw)
+                os.replace(temp, path)
 
     def mode(self):
-        selected = self.get(
-            "mode",
-            {"mode": "OFF"}
-        ).get("mode", "OFF")
-
-        return (
-            selected
-            if selected in MODES
-            else "OFF"
-        )
+        selected = self.get('mode', {'mode': 'OFF'}).get('mode', 'OFF')
+        return selected if selected in MODES else 'OFF'
 
     def trades(self):
-        return self.get("trades", [])
+        return self.get('trades', [])
 
     def append_trade(self, item):
         with self.lock:
             trades = self.trades()
-
-            exists = any(
-                str(t.get("id"))
-                == str(item.get("id"))
-                for t in trades
-            )
-
-            if not exists:
+            if not any(str(t.get('id')) == str(item.get('id')) for t in trades):
                 trades.append(item)
-                self.set("trades", trades)
+                self.set('trades', trades)
 
     def event(self, kind, detail):
         with self.lock:
-            entries = self.get("events", [])
-
-            entries.append({
-                "time": now(),
-                "kind": kind,
-                "detail": safe_error(detail),
-            })
-
-            self.set(
-                "events",
-                entries[-150:],
-            )
+            entries = self.get('events', [])
+            entries.append({'time': now(), 'kind': kind, 'detail': safe_error(detail)})
+            self.set('events', entries[-150:])
 
     def seen(self, signal):
-        return signal in self.get(
-            "signal_ids", []
-        )
+        return signal in self.get('signal_ids', [])
 
     def remember(self, signal):
         with self.lock:
-            ids = self.get(
-                "signal_ids", []
-            )
-
+            ids = self.get('signal_ids', [])
             if signal not in ids:
                 ids.append(signal)
-
-                self.set(
-                    "signal_ids",
-                    ids[-500:],
-                )
+                self.set('signal_ids', ids[-500:])
 
 
 store = Store()
 
 
-# ============================================================
-# API BINGX
-# ============================================================
-
 class BingX:
-
-    def call(
-        self,
-        method,
-        path,
-        params=None,
-        private=True,
-    ):
+    def call(self, method, path, params=None, private=True):
         params = dict(params or {})
         headers = {}
-
         if private:
             if not API_KEY or not API_SECRET:
-                raise RuntimeError(
-                    "Faltan claves de BingX"
-                )
-
-            params.update(
-                timestamp=int(time.time() * 1000),
-                recvWindow=5000,
-            )
-
-            encoded = urlencode(
-                sorted(params.items())
-            )
-
-            sign = hmac.new(
-                API_SECRET.encode(),
-                encoded.encode(),
-                hashlib.sha256,
-            ).hexdigest()
-
-            url = (
-                f"{BASE}{path}?"
-                f"{encoded}&signature={sign}"
-            )
-
-            headers["X-BX-APIKEY"] = API_KEY
-
+                raise RuntimeError('Faltan claves de BingX')
+            params.update(timestamp=int(time.time() * 1000), recvWindow=5000)
+            encoded = urlencode(sorted(params.items()))
+            sign = hmac.new(API_SECRET.encode(), encoded.encode(), hashlib.sha256).hexdigest()
+            url = f'{BASE}{path}?{encoded}&signature={sign}'
+            headers['X-BX-APIKEY'] = API_KEY
         else:
             encoded = urlencode(params)
-
-            url = (
-                f"{BASE}{path}"
-                + (
-                    f"?{encoded}"
-                    if encoded else ""
-                )
-            )
-
-        response = requests.request(
-            method,
-            url,
-            headers=headers,
-            timeout=20,
-        )
-
+            url = f'{BASE}{path}' + (f'?{encoded}' if encoded else '')
+        response = requests.request(method, url, headers=headers, timeout=20)
         try:
             result = response.json()
         except ValueError:
-            raise RuntimeError(
-                "BingX no devolvió JSON "
-                f"(HTTP {response.status_code})"
-            )
-
-        if (
-            response.status_code >= 400
-            or str(result.get("code")) != "0"
-        ):
-            raise RuntimeError(
-                "Error BingX: "
-                + safe_error(result)
-            )
-
-        return result.get("data")
-
-    # --------------------------------------------------------
-    # PRECIO
-    # --------------------------------------------------------
+            raise RuntimeError(f'BingX no devolvió JSON (HTTP {response.status_code})')
+        if response.status_code >= 400 or str(result.get('code')) != '0':
+            raise RuntimeError('Error BingX: ' + safe_error(result))
+        return result.get('data')
 
     def price(self):
-        data = self.call(
-            "GET",
-            "/openApi/swap/v2/quote/price",
-            {"symbol": SYMBOL},
-            False,
-        )
-
+        data = self.call('GET', '/openApi/swap/v2/quote/price', {'symbol': SYMBOL}, False)
         if isinstance(data, list):
             data = data[0] if data else {}
-
-        price = number(
-            (data or {}).get("price")
-            or (data or {}).get("lastPrice")
-        )
-
+        price = number((data or {}).get('price') or (data or {}).get('lastPrice'))
         if price <= 0:
-            raise RuntimeError(
-                "Precio WTI no disponible"
-            )
-
+            raise RuntimeError('Precio WTI no disponible')
         return price
 
-    # --------------------------------------------------------
-    # CONTRATO
-    # --------------------------------------------------------
-
     def contract(self):
-        data = self.call(
-            "GET",
-            "/openApi/swap/v2/quote/contracts",
-            private=False,
-        )
-
+        data = self.call('GET', '/openApi/swap/v2/quote/contracts', private=False)
         if isinstance(data, dict):
-            data = (
-                data.get("contracts")
-                or data.get("data")
-                or [data]
-            )
-
-        found = [
-            c for c in (data or [])
-            if (
-                isinstance(c, dict)
-                and str(
-                    c.get("symbol", "")
-                ).upper() == SYMBOL
-            )
-        ]
-
+            data = data.get('contracts') or data.get('data') or [data]
+        found = [c for c in (data or []) if isinstance(c, dict) and str(c.get('symbol', '')).upper() == SYMBOL]
         if len(found) != 1:
-            raise RuntimeError(
-                "Contrato WTI no encontrado "
-                "de manera única"
-            )
-
+            raise RuntimeError('Contrato WTI no encontrado de manera única')
         c = found[0]
-
-        precision = c.get(
-            "quantityPrecision"
-        )
-
-        minimum = number(
-            c.get("tradeMinQuantity")
-            or c.get("minQty")
-        )
-
-        if (
-            precision is None
-            or minimum <= 0
-        ):
-            raise RuntimeError(
-                "Datos de cantidad incompletos "
-                "en el contrato"
-            )
-
-        step = str(
-            Decimal("1").scaleb(
-                -int(precision)
-            )
-        )
-
-        return {
-            "step": step,
-            "minimum": minimum,
-            "min_notional": number(
-                c.get("tradeMinUSDT")
-            ),
-            "raw": c,
-        }
-
-    # --------------------------------------------------------
-    # BALANCE
-    # --------------------------------------------------------
+        precision = c.get('quantityPrecision')
+        minimum = number(c.get('tradeMinQuantity') or c.get('minQty'))
+        if precision is None or minimum <= 0:
+            raise RuntimeError('Datos de cantidad incompletos en el contrato')
+        return {'step': str(Decimal('1').scaleb(-int(precision))), 'minimum': minimum, 'min_notional': number(c.get('tradeMinUSDT')), 'raw': c}
 
     def balance(self):
-        data = self.call(
-            "GET",
-            "/openApi/swap/v3/user/balance",
-        )
-
+        data = self.call('GET', '/openApi/swap/v3/user/balance')
         items = []
-
         if isinstance(data, list):
             items = data
-
         elif isinstance(data, dict):
-            for item in (
-                data.get("balance"),
-                data.get("balances"),
-                data,
-            ):
-                if isinstance(item, list):
-                    items += item
-                elif isinstance(item, dict):
-                    items.append(item)
-
+            for item in (data.get('balance'), data.get('balances'), data):
+                items += item if isinstance(item, list) else [item] if isinstance(item, dict) else []
         for item in items:
-            if not isinstance(item, dict):
+            if not isinstance(item, dict) or str(item.get('asset') or item.get('currency') or 'USDT').upper() != 'USDT':
                 continue
-
-            asset = str(
-                item.get("asset")
-                or item.get("currency")
-                or "USDT"
-            ).upper()
-
-            if asset != "USDT":
-                continue
-
-            for key in (
-                "availableMargin",
-                "availableBalance",
-                "available",
-            ):
-                if (
-                    key in item
-                    and number(
-                        item[key], -1
-                    ) >= 0
-                ):
+            for key in ('availableMargin', 'availableBalance', 'available'):
+                if key in item and number(item[key], -1) >= 0:
                     return number(item[key])
-
-        raise RuntimeError(
-            "Balance USDT disponible "
-            "no encontrado"
-        )
-
-    # --------------------------------------------------------
-    # POSICIONES REALES
-    # --------------------------------------------------------
+        raise RuntimeError('Balance USDT disponible no encontrado')
 
     def positions(self):
-        data = self.call(
-            "GET",
-            "/openApi/swap/v2/user/positions",
-            {"symbol": SYMBOL},
-        )
-
+        data = self.call('GET', '/openApi/swap/v2/user/positions', {'symbol': SYMBOL})
         if isinstance(data, dict):
             data = [data]
-
         output = []
-
         for p in data or []:
-            if not isinstance(p, dict):
+            if not isinstance(p, dict) or str(p.get('symbol', SYMBOL)).upper() != SYMBOL:
                 continue
-
-            if str(
-                p.get("symbol", SYMBOL)
-            ).upper() != SYMBOL:
-                continue
-
-            qty = number(
-                p.get("positionAmt")
-                if p.get("positionAmt") is not None
-                else p.get("positionAmount")
-                if p.get("positionAmount") is not None
-                else p.get("availableAmt")
-                if p.get("availableAmt") is not None
-                else p.get("quantity")
-            )
-
+            qty = number(p.get('positionAmt') if p.get('positionAmt') is not None else p.get('positionAmount') if p.get('positionAmount') is not None else p.get('availableAmt') if p.get('availableAmt') is not None else p.get('quantity'))
             if qty == 0:
                 continue
-
-            side = str(
-                p.get("positionSide", "")
-            ).upper()
-
-            if side not in (
-                "LONG", "SHORT"
-            ):
-                side = (
-                    "LONG" if qty > 0
-                    else "SHORT"
-                )
-
-            output.append({
-                "side": side,
-                "quantity": abs(qty),
-                "entry_price": number(
-                    p.get("avgPrice")
-                    or p.get("entryPrice")
-                ),
-                "leverage": number(
-                    p.get("leverage"),
-                    LEVERAGE,
-                ),
-                "margin_used": number(
-                    p.get("initialMargin")
-                    or p.get("isolatedMargin")
-                    or p.get("margin")
-                ),
-                "unrealized_pnl": number(
-                    p.get("unrealizedProfit")
-                    or p.get("unrealizedPnl")
-                ),
-            })
-
+            side = str(p.get('positionSide', '')).upper()
+            if side not in ('LONG', 'SHORT'):
+                side = 'LONG' if qty > 0 else 'SHORT'
+            output.append({'side': side, 'quantity': abs(qty), 'entry_price': number(p.get('avgPrice') or p.get('entryPrice')), 'leverage': number(p.get('leverage'), LEVERAGE), 'margin_used': number(p.get('initialMargin') or p.get('isolatedMargin') or p.get('margin')), 'unrealized_pnl': number(p.get('unrealizedProfit') or p.get('unrealizedPnl')), 'position_id': str(p.get('positionId') or '')})
         return output
 
-    # --------------------------------------------------------
-    # MODO HEDGE
-    # --------------------------------------------------------
-
     def hedge(self):
-        data = self.call(
-            "GET",
-            "/openApi/swap/v1/positionSide/dual",
-        )
-
-        value = (
-            data.get("dualSidePosition")
-            if isinstance(data, dict)
-            else data
-        )
-
-        return (
-            value is True
-            or str(value).lower() == "true"
-        )
-
-    # --------------------------------------------------------
-    # TIPO DE MARGEN
-    # --------------------------------------------------------
+        data = self.call('GET', '/openApi/swap/v1/positionSide/dual')
+        value = data.get('dualSidePosition') if isinstance(data, dict) else data
+        return value is True or str(value).lower() == 'true'
 
     def margin_type(self):
-        data = self.call(
-            "GET",
-            "/openApi/swap/v2/trade/marginType",
-            {"symbol": SYMBOL},
-        )
-
-        return (
-            str(
-                data.get("marginType", "")
-            ).upper()
-            if isinstance(data, dict)
-            else ""
-        )
-
-    # --------------------------------------------------------
-    # CONFIGURACIÓN DE OPERACIONES
-    # --------------------------------------------------------
+        data = self.call('GET', '/openApi/swap/v2/trade/marginType', {'symbol': SYMBOL})
+        return str(data.get('marginType', '')).upper() if isinstance(data, dict) else ''
 
     def configure(self):
         if not self.hedge():
-            self.call(
-                "POST",
-                "/openApi/swap/v1/positionSide/dual",
-                {
-                    "dualSidePosition": "true"
-                },
-            )
+            self.call('POST', '/openApi/swap/v1/positionSide/dual', {'dualSidePosition': 'true'})
+        if self.margin_type() != 'ISOLATED':
+            self.call('POST', '/openApi/swap/v2/trade/marginType', {'symbol': SYMBOL, 'marginType': 'ISOLATED'})
+        for direction in ('LONG', 'SHORT'):
+            self.call('POST', '/openApi/swap/v2/trade/leverage', {'symbol': SYMBOL, 'side': direction, 'leverage': LEVERAGE})
 
-        if self.margin_type() != "ISOLATED":
-            self.call(
-                "POST",
-                "/openApi/swap/v2/trade/marginType",
-                {
-                    "symbol": SYMBOL,
-                    "marginType": "ISOLATED",
-                },
-            )
-
-        for direction in (
-            "LONG", "SHORT"
-        ):
-            self.call(
-                "POST",
-                "/openApi/swap/v2/trade/leverage",
-                {
-                    "symbol": SYMBOL,
-                    "side": direction,
-                    "leverage": LEVERAGE,
-                },
-            )
-
-    # --------------------------------------------------------
-    # ORDEN REAL MARKET
-    # --------------------------------------------------------
-
-    def order(
-        self,
-        side,
-        direction,
-        quantity,
-    ):
-        data = self.call(
-            "POST",
-            "/openApi/swap/v2/trade/order",
-            {
-                "symbol": SYMBOL,
-                "side": side,
-                "positionSide": direction,
-                "type": "MARKET",
-                "quantity": quantity,
-            },
-        )
-
-        if (
-            isinstance(data, dict)
-            and isinstance(
-                data.get("order"), dict
-            )
-        ):
-            data = data["order"]
-
-        return (
-            data
-            if isinstance(data, dict)
-            else {}
-        )
-
-    # --------------------------------------------------------
-    # DETALLE DE ORDEN
-    # --------------------------------------------------------
+    def order(self, side, direction, quantity):
+        data = self.call('POST', '/openApi/swap/v2/trade/order', {'symbol': SYMBOL, 'side': side, 'positionSide': direction, 'type': 'MARKET', 'quantity': quantity})
+        if isinstance(data, dict) and isinstance(data.get('order'), dict):
+            data = data['order']
+        return data if isinstance(data, dict) else {}
 
     def order_detail(self, order_id):
-        data = self.call(
-            "GET",
-            "/openApi/swap/v2/trade/order",
-            {
-                "symbol": SYMBOL,
-                "orderId": str(order_id),
-            },
-        )
+        data = self.call('GET', '/openApi/swap/v2/trade/order', {'symbol': SYMBOL, 'orderId': str(order_id)})
+        if isinstance(data, dict) and isinstance(data.get('order'), dict):
+            data = data['order']
+        return data if isinstance(data, dict) else {}
 
-        if (
-            isinstance(data, dict)
-            and isinstance(
-                data.get("order"), dict
-            )
-        ):
-            data = data["order"]
-
-        return (
-            data
-            if isinstance(data, dict)
-            else {}
-        )
-
-    # --------------------------------------------------------
-    # HISTORIAL DE ÓRDENES
-    # --------------------------------------------------------
-
-    def orders_window(
-        self,
-        start_ms,
-        end_ms,
-    ):
-        data = self.call(
-            "GET",
-            "/openApi/swap/v2/trade/allOrders",
-            {
-                "symbol": SYMBOL,
-                "startTime": start_ms,
-                "endTime": end_ms,
-                "limit": 1000,
-            },
-        )
-
+    def orders_window(self, start_ms, end_ms):
+        data = self.call('GET', '/openApi/swap/v2/trade/allOrders', {'symbol': SYMBOL, 'startTime': start_ms, 'endTime': end_ms, 'limit': 1000})
         if isinstance(data, dict):
-            data = (
-                data.get("orders")
-                or data.get("list")
-                or data.get("data")
-                or []
-            )
-
-        return (
-            data
-            if isinstance(data, list)
-            else []
-        )
+            data = data.get('orders') or data.get('list') or data.get('data') or []
+        return data if isinstance(data, list) else []
 
     # --------------------------------------------------------
-    # EJECUCIONES REALES DE BINGX
-    # CORRECCIÓN DE PNL PENDIENTE
+    # HISTORIAL DE POSICIONES CERRADAS (FUENTE DE PNL NETO)
     # --------------------------------------------------------
 
-    def fills(
-        self,
-        order_id,
-        start_ms,
-        end_ms,
-    ):
-        """
-        Consulta allFillOrders.
-
-        COIN y CONT son las dos unidades
-        de negociación admitidas por BingX.
-
-        Los resultados deben coincidir
-        exactamente con orderId y símbolo.
-
-        No se inventan ejecuciones.
-        """
-
-        errors = []
-        empty_units = []
-
-        for unit in ("COIN", "CONT"):
-            try:
-                data = self.call(
-                    "GET",
-                    "/openApi/swap/v2/trade/allFillOrders",
-                    {
-                        "tradingUnit": unit,
-                        "startTs": int(start_ms),
-                        "endTs": int(end_ms),
-                        "orderId": str(order_id),
-                        "currency": "USDT",
-                    },
-                )
-
-            except Exception as exc:
-                errors.append(
-                    f"{unit}: {safe_error(exc)}"
-                )
-                continue
-
+    def position_history(self, start_ms, end_ms):
+        """Consulta positionHistory. Solo operaciones reales; no emite órdenes."""
+        rows = []
+        page_size = 100
+        for page in range(1, 21):
+            data = self.call('GET', '/openApi/swap/v1/trade/positionHistory', {
+                'symbol': SYMBOL,
+                'currency': 'USDT',
+                'startTs': int(start_ms),
+                'endTs': int(end_ms),
+                'pageIndex': page,
+                'pageSize': page_size,
+            })
             if isinstance(data, dict):
-                rows = data.get("fill_orders")
-
-                if rows is None:
-                    rows = data.get("fills")
-
-                if rows is None:
-                    rows = data.get("orders")
-
-                if rows is None:
-                    rows = data.get("list")
-
-                if rows is None:
-                    rows = data.get("data")
+                current = data.get('list')
+                if current is None:
+                    current = data.get('positions')
+                if current is None:
+                    current = data.get('data')
+                total = data.get('total')
+            elif isinstance(data, list):
+                current, total = data, None
             else:
-                rows = data
-
-            if rows is None:
-                rows = []
-
-            if not isinstance(rows, list):
-                raise RuntimeError(
-                    "Formato de ejecuciones "
-                    f"desconocido para {unit}"
-                )
-
-            if len(rows) >= 1000:
-                raise RuntimeError(
-                    "Demasiadas ejecuciones para "
-                    "conciliar con seguridad"
-                )
-
-            matched = [
-                row for row in rows
-                if (
-                    isinstance(row, dict)
-                    and str(
-                        row.get("orderId")
-                        or row.get("orderID")
-                        or ""
-                    ) == str(order_id)
-                    and str(
-                        row.get(
-                            "symbol", SYMBOL
-                        )
-                    ).upper() == SYMBOL
-                )
-            ]
-
-            if matched:
-                seen_ids = set()
-                unique = []
-
-                for row in matched:
-                    trade_id = str(
-                        row.get("tradeId")
-                        or row.get("fillId")
-                        or ""
-                    )
-
-                    if (
-                        trade_id
-                        and trade_id in seen_ids
-                    ):
-                        continue
-
-                    if trade_id:
-                        seen_ids.add(trade_id)
-
-                    unique.append(row)
-
-                return unique
-
-            empty_units.append(unit)
-
-        if errors and not empty_units:
-            raise RuntimeError(
-                "BingX rechazó consultas "
-                "de ejecuciones: "
-                + "; ".join(errors)
-            )
-
-        if errors:
-            raise RuntimeError(
-                "Sin ejecuciones confirmadas; "
-                + "; ".join(errors)
-            )
-
-        return []
-
-    # --------------------------------------------------------
-    # FUNDING REAL
-    # --------------------------------------------------------
-
-    def funding(
-        self,
-        start_ms,
-        end_ms,
-    ):
-        data = self.call(
-            "GET",
-            "/openApi/swap/v2/user/income",
-            {
-                "symbol": SYMBOL,
-                "incomeType": "FUNDING_FEE",
-                "startTime": start_ms,
-                "endTime": end_ms,
-                "limit": 1000,
-            },
-        )
-
-        if isinstance(data, dict):
-            data = (
-                data.get("list")
-                or data.get("data")
-                or []
-            )
-
-        if (
-            not isinstance(data, list)
-            or len(data) >= 1000
-        ):
-            raise RuntimeError(
-                "Historial de funding incompleto"
-            )
-
-        return sum(
-            number(item.get("income"))
-            for item in data
-            if (
-                isinstance(item, dict)
-                and str(
-                    item.get(
-                        "symbol", SYMBOL
-                    )
-                ).upper() == SYMBOL
-                and item.get("incomeType")
-                == "FUNDING_FEE"
-                and start_ms
-                <= int(
-                    number(
-                        item.get("time")
-                    )
-                )
-                <= end_ms
-            )
-        )
+                raise RuntimeError('Formato no reconocido en positionHistory')
+            if not isinstance(current, list):
+                raise RuntimeError('BingX no devolvió lista de posiciones cerradas')
+            rows.extend(current)
+            if total is not None:
+                if len(rows) >= int(total):
+                    break
+            elif len(current) < page_size:
+                break
+        else:
+            raise RuntimeError('Historial paginado incompleto; no se atribuye PnL')
+        return rows
 
 
 bingx = BingX()
 
 
-# ============================================================
-# SINCRONIZAR POSICIÓN REAL
-# ============================================================
-
 def sync_position():
     positions = bingx.positions()
-
     if len(positions) > 1:
-        raise RuntimeError(
-            "Varias posiciones WTI detectadas: "
-            "revisar BingX"
-        )
-
-    live = (
-        positions[0]
-        if positions else None
-    )
-
-    saved = store.get(
-        "active_trade", None
-    )
-
+        raise RuntimeError('Varias posiciones WTI detectadas: revisar BingX')
+    live = positions[0] if positions else None
+    saved = store.get('active_trade', None)
     if live:
-        if (
-            not saved
-            or saved.get("side")
-            != live["side"]
-        ):
-            saved = {
-                "id": str(uuid.uuid4()),
-                "opened_at": now(),
-                "side": live["side"],
-                "symbol": SYMBOL,
-                "source": "MANUAL_SYNC",
-            }
-
-            store.event(
-                "SYNC",
-                (
-                    f"Posición {live['side']} "
-                    "recuperada desde BingX"
-                ),
-            )
-
-        saved.update({
-            key: live[key]
-            for key in (
-                "side",
-                "quantity",
-                "entry_price",
-                "leverage",
-                "margin_used",
-            )
-        })
-
-        store.set(
-            "active_trade", saved
-        )
-
+        if not saved or saved.get('side') != live['side']:
+            saved = {'id': str(uuid.uuid4()), 'opened_at': now(), 'side': live['side'], 'symbol': SYMBOL, 'source': 'MANUAL_SYNC'}
+            store.event('SYNC', f'Posición {live["side"]} recuperada desde BingX')
+        saved.update({key: live[key] for key in ('side', 'quantity', 'entry_price', 'leverage', 'margin_used', 'position_id')})
+        store.set('active_trade', saved)
     elif saved:
-        store.event(
-            "SYNC_WARNING",
-            (
-                "Posición ausente en BingX; "
-                "revisar cierre externo y PnL"
-            ),
-        )
-
-        store.set(
-            "active_trade", None
-        )
-
+        store.event('SYNC_WARNING', 'Posición ausente en BingX; revisar cierre externo y PnL')
+        store.set('active_trade', None)
     return live
 
 
-def wait_position(
-    direction=None,
-    timeout=9,
-):
+def wait_position(direction=None, timeout=9):
     end = time.time() + timeout
-
     while time.time() < end:
         positions = bingx.positions()
-
         if len(positions) > 1:
-            raise RuntimeError(
-                "Hay varias posiciones; "
-                "revisar cuenta"
-            )
-
-        if (
-            direction is None
-            and not positions
-        ):
+            raise RuntimeError('Hay varias posiciones; revisar cuenta')
+        if direction is None and not positions:
             return None
-
-        if (
-            direction
-            and len(positions) == 1
-            and positions[0]["side"]
-            == direction
-        ):
+        if direction and len(positions) == 1 and positions[0]['side'] == direction:
             return positions[0]
-
         time.sleep(0.4)
+    raise RuntimeError('Orden enviada pero BingX aún no confirma estado. Verificar cuenta antes de repetir')
 
-    raise RuntimeError(
-        "Orden enviada pero BingX aún no "
-        "confirma estado. Verificar cuenta "
-        "antes de repetir"
-    )
-
-
-# ============================================================
-# APERTURA REAL
-# ============================================================
 
 def open_trade(direction):
     if sync_position():
-        return {
-            "status": "ignored",
-            "reason": "position_already_open",
-        }
-
-    if not (
-        0 < BALANCE_PERCENT <= 100
-    ) or LEVERAGE < 1:
-        raise RuntimeError(
-            "Porcentaje o leverage inválido"
-        )
-
+        return {'status': 'ignored', 'reason': 'position_already_open'}
+    if not 0 < BALANCE_PERCENT <= 100 or LEVERAGE < 1:
+        raise RuntimeError('Porcentaje o leverage inválido')
     rules = bingx.contract()
-
     price = bingx.price()
     balance = bingx.balance()
-
-    margin = (
-        balance * BALANCE_PERCENT / 100
-    )
-
-    qty_dec = (
-        (
-            dec(
-                margin * LEVERAGE / price
-            )
-            / dec(rules["step"])
-        ).to_integral_value(
-            rounding=ROUND_DOWN
-        )
-        * dec(rules["step"])
-    )
-
-    if (
-        float(qty_dec) < rules["minimum"]
-        or (
-            rules["min_notional"]
-            and float(qty_dec) * price
-            < rules["min_notional"]
-        )
-    ):
-        raise RuntimeError(
-            "Saldo insuficiente para "
-            "la cantidad mínima WTI"
-        )
-
-    qty = format(qty_dec, "f")
-
+    margin = balance * BALANCE_PERCENT / 100
+    qty_dec = (dec(margin * LEVERAGE / price) / dec(rules['step'])).to_integral_value(rounding=ROUND_DOWN) * dec(rules['step'])
+    if float(qty_dec) < rules['minimum'] or (rules['min_notional'] and float(qty_dec) * price < rules['min_notional']):
+        raise RuntimeError('Saldo insuficiente para la cantidad mínima WTI')
+    qty = format(qty_dec, 'f')
     bingx.configure()
-
-    order = bingx.order(
-        (
-            "BUY"
-            if direction == "LONG"
-            else "SELL"
-        ),
-        direction,
-        qty,
-    )
-
+    order = bingx.order('BUY' if direction == 'LONG' else 'SELL', direction, qty)
     live = wait_position(direction)
+    trade = {'id': str(uuid.uuid4()), 'opened_at': now(), 'side': direction, 'symbol': SYMBOL, 'quantity': live['quantity'], 'entry_price': live['entry_price'], 'leverage': live['leverage'], 'margin_used': live['margin_used'] or margin, 'balance_before': balance, 'open_order_id': str(order.get('orderID') or order.get('orderId') or ''), 'source': 'AUTO'}
+    store.set('active_trade', trade)
+    store.event('ORDER_OPENED', f'{direction} qty={trade["quantity"]} price={trade["entry_price"]}')
+    telegram(f'{BOT_NAME}\nAPERTURA {direction}\nPrecio: {trade["entry_price"]}\nCantidad: {trade["quantity"]}')
+    return {'status': 'opened', 'trade': trade}
 
-    trade = {
-        "id": str(uuid.uuid4()),
-        "opened_at": now(),
-        "side": direction,
-        "symbol": SYMBOL,
-        "quantity": live["quantity"],
-        "entry_price": live["entry_price"],
-        "leverage": live["leverage"],
-        "margin_used": (
-            live["margin_used"]
-            or margin
-        ),
-        "balance_before": balance,
-        "open_order_id": str(
-            order.get("orderID")
-            or order.get("orderId")
-            or ""
-        ),
-        "source": "AUTO",
-    }
-
-    store.set(
-        "active_trade", trade
-    )
-
-    store.event(
-        "ORDER_OPENED",
-        (
-            f"{direction} "
-            f"qty={trade['quantity']} "
-            f"price={trade['entry_price']}"
-        ),
-    )
-
-    telegram(
-        f"{BOT_NAME}\n"
-        f"APERTURA {direction}\n"
-        f"Precio: {trade['entry_price']}\n"
-        f"Cantidad: {trade['quantity']}"
-    )
-
-    return {
-        "status": "opened",
-        "trade": trade,
-    }
-
-
-# ============================================================
-# CIERRE REAL
-# ============================================================
 
 def close_trade(direction, reason):
     live = sync_position()
-
-    if (
-        not live
-        or live["side"] != direction
-    ):
-        return {
-            "status": "ignored",
-            "reason": "no_matching_position",
-        }
-
-    saved = store.get(
-        "active_trade", None
-    ) or {}
-
-    order = bingx.order(
-        (
-            "SELL"
-            if direction == "LONG"
-            else "BUY"
-        ),
-        direction,
-        live["quantity"],
-    )
-
+    if not live or live['side'] != direction:
+        return {'status': 'ignored', 'reason': 'no_matching_position'}
+    saved = store.get('active_trade', None) or {}
+    order = bingx.order('SELL' if direction == 'LONG' else 'BUY', direction, live['quantity'])
     wait_position(None)
-
     trade = {
-        "id": (
-            saved.get("id")
-            or str(uuid.uuid4())
-        ),
-        "opened_at": saved.get(
-            "opened_at", now()
-        ),
-        "closed_at": now(),
-        "side": direction,
-        "symbol": SYMBOL,
-        "quantity": live["quantity"],
-        "entry_price": live["entry_price"],
-        "exit_price": 0,
-        "leverage": live["leverage"],
-        "margin_used": live["margin_used"],
-        "open_order_id": str(
-            saved.get("open_order_id")
-            or ""
-        ),
-        "close_order_id": str(
-            order.get("orderID")
-            or order.get("orderId")
-            or ""
-        ),
-        "gross_pnl": 0,
-        "total_fees": 0,
-        "funding": 0,
-        "net_pnl": 0,
-        "pnl_pending": True,
-        "risk_usd": 0,
-        "r_multiple": 0,
-        "price_move_pct": 0,
-        "balance_before": saved.get(
-            "balance_before", 0
-        ),
-        "source": saved.get(
-            "source", "AUTO"
-        ),
-        "close_reason": reason,
+        'id': saved.get('id') or str(uuid.uuid4()), 'opened_at': saved.get('opened_at', now()), 'closed_at': now(),
+        'side': direction, 'symbol': SYMBOL, 'quantity': live['quantity'], 'entry_price': live['entry_price'],
+        'exit_price': 0, 'leverage': live['leverage'], 'margin_used': live['margin_used'],
+        'position_id': str(saved.get('position_id') or live.get('position_id') or ''),
+        'open_order_id': str(saved.get('open_order_id') or ''),
+        'close_order_id': str(order.get('orderID') or order.get('orderId') or ''),
+        'gross_pnl': 0, 'total_fees': 0, 'funding': 0, 'net_pnl': 0, 'pnl_pending': True,
+        'risk_usd': 0, 'r_multiple': 0, 'price_move_pct': 0,
+        'balance_before': saved.get('balance_before', 0), 'source': saved.get('source', 'AUTO'),
+        'close_reason': reason,
     }
-
     store.append_trade(trade)
-
-    store.set(
-        "active_trade", None
-    )
-
-    store.event(
-        "ORDER_CLOSED",
-        (
-            f"{direction} cerrado: "
-            "iniciando conciliación del PnL"
-        ),
-    )
-
-    telegram(
-        f"{BOT_NAME}\n"
-        f"CIERRE {direction}\n"
-        "Consultando PnL real de BingX"
-    )
-
+    store.set('active_trade', None)
+    store.event('ORDER_CLOSED', f'{direction} cerrado: iniciando conciliación del PnL')
+    telegram(f'{BOT_NAME}\nCIERRE {direction}\nConsultando PnL real de BingX')
     try:
         reconcile_pending(force=True)
-
     except Exception as exc:
-        store.event(
-            "PNL_ERROR",
-            safe_error(exc),
-        )
-
-    return {
-        "status": "closed",
-        "trade_id": trade["id"],
-        "pnl_status": "ver panel",
-    }
+        store.event('PNL_ERROR', safe_error(exc))
+    return {'status': 'closed', 'trade_id': trade['id'], 'pnl_status': 'ver panel'}
 
 
 # ============================================================
-# IDENTIFICACIÓN DE ÓRDENES
+# PNL REAL DE CADA POSICION CERRADA: BingX positionHistory
 # ============================================================
 
-def order_key(item):
-    return str(
-        item.get("orderID")
-        or item.get("orderId")
-        or ""
-    )
+def position_fingerprint(p):
+    """Clave única del cierre; evita atribuirlo a dos operaciones."""
+    posid = str(p.get('positionId') or '')
+    if posid:
+        return 'position:' + posid
+    return 'fallback:' + ':'.join(str(p.get(k, '')) for k in (
+        'symbol', 'positionSide', 'openTime', 'updateTime',
+        'avgPrice', 'avgClosePrice', 'closePositionAmt'))
 
 
-def resolve_old_open_id(trade):
+def match_position(trade, positions, used):
+    """Coincidencia única basada en tiempo, lado, precio y cantidad.
+
+    No usa solo una hora o solo la dirección: dos shorts seguidos no
+    pueden consumir un mismo registro de posición.
     """
-    Recupera el ID de entrada de
-    operaciones antiguas que no
-    guardaron ese campo.
-
-    Exige coincidencia única de
-    símbolo, dirección, fecha,
-    precio y cantidad.
-    """
-
-    opened = epoch_ms(
-        trade.get("opened_at")
-    )
-
-    if not opened:
-        return ""
-
-    orders = bingx.orders_window(
-        max(0, opened - 120000),
-        opened + 120000,
-    )
-
-    expected = (
-        "SELL"
-        if trade.get("side") == "SHORT"
-        else "BUY"
-    )
-
-    candidates = []
-
-    for item in orders:
-        if not isinstance(item, dict):
+    opened = epoch_ms(trade.get('opened_at'))
+    closed = epoch_ms(trade.get('closed_at'))
+    if not opened or not closed or closed < opened:
+        raise RuntimeError('El registro pendiente no tiene fechas válidas')
+    side = str(trade.get('side', '')).upper()
+    entry = number(trade.get('entry_price'))
+    qty = number(trade.get('quantity'))
+    known_id = str(trade.get('position_id') or '')
+    matches = []
+    for p in positions:
+        if not isinstance(p, dict):
             continue
-
-        timestamp = int(
-            number(
-                item.get("time")
-                or item.get("updateTime")
-            )
-        )
-
-        price = number(
-            item.get("avgPrice")
-            or item.get("price")
-        )
-
-        qty = number(
-            item.get("executedQty")
-            or item.get("origQty")
-            or item.get("quantity")
-        )
-
-        if (
-            str(
-                item.get("symbol", SYMBOL)
-            ).upper() == SYMBOL
-            and str(
-                item.get("side", "")
-            ).upper() == expected
-            and str(
-                item.get(
-                    "positionSide",
-                    trade["side"],
-                )
-            ).upper() == trade["side"]
-            and str(
-                item.get("status", "")
-            ).upper() == "FILLED"
-            and timestamp
-            and abs(
-                timestamp - opened
-            ) <= 120000
-            and price
-            and abs(
-                price
-                - number(
-                    trade.get("entry_price")
-                )
-            ) <= 0.06
-            and qty
-            and abs(
-                qty
-                - number(
-                    trade.get("quantity")
-                )
-            ) <= 0.0001
-            and order_key(item)
-        ):
-            candidates.append(
-                order_key(item)
-            )
-
-    return (
-        candidates[0]
-        if len(set(candidates)) == 1
-        else ""
-    )
+        if str(p.get('symbol', '')).upper() != SYMBOL:
+            continue
+        if str(p.get('positionSide', '')).upper() != side:
+            continue
+        key = position_fingerprint(p)
+        if key in used:
+            continue
+        if p.get('closeAllPositions') is False:
+            continue
+        # Debe ser un cierre real, con PnL neto suministrado por BingX.
+        if p.get('netProfit') is None:
+            continue
+        pid = str(p.get('positionId') or '')
+        if known_id and pid and known_id != pid:
+            continue
+        a = epoch_ms(p.get('openTime'))
+        b = epoch_ms(p.get('updateTime') or p.get('closeTime'))
+        if not a or not b:
+            continue
+        if abs(a - opened) > 15 * 60 * 1000:
+            continue
+        if abs(b - closed) > 15 * 60 * 1000:
+            continue
+        px = number(p.get('avgPrice'))
+        if entry > 0 and (px <= 0 or abs(px - entry) > max(0.16, entry * 0.002)):
+            continue
+        amount_raw = p.get('closePositionAmt')
+        if amount_raw is None:
+            amount_raw = p.get('positionAmt')
+        amount = abs(number(amount_raw))
+        if qty > 0 and amount_raw is not None and amount > 0:
+            if abs(qty - amount) > max(0.00005, qty * 0.006):
+                continue
+        matches.append(p)
+    if not matches:
+        raise RuntimeError('Aún no hay posición cerrada coincidente en BingX')
+    if len(matches) != 1:
+        raise RuntimeError(f'Hay {len(matches)} cierres posibles; PnL no asignado para evitar errores')
+    return matches[0]
 
 
-# ============================================================
-# RESUMEN DE EJECUCIONES
-# ============================================================
-
-def confirmed_fill_summary(fills):
-    if not fills:
-        raise RuntimeError(
-            "Todavía no se publicaron "
-            "las ejecuciones de la orden"
-        )
-
-    gross = Decimal("0")
-    fees = Decimal("0")
-    qty = Decimal("0")
-    weighted = Decimal("0")
-
-    for fill in fills:
-        qty_raw = (
-            fill.get("qty")
-            if fill.get("qty") is not None
-            else fill.get("volume")
-            if fill.get("volume") is not None
-            else fill.get("quantity")
-        )
-
-        price_raw = (
-            fill.get("price")
-            if fill.get("price") is not None
-            else fill.get("tradePrice")
-        )
-
-        if (
-            qty_raw is None
-            or price_raw is None
-            or fill.get("realizedPnl") is None
-        ):
-            raise RuntimeError(
-                "Ejecución BingX incompleta: "
-                "qty/price/realizedPnl"
-            )
-
-        unit_qty = dec(qty_raw)
-        unit_price = dec(price_raw)
-
-        qty += unit_qty
-
-        weighted += (
-            unit_qty * unit_price
-        )
-
-        gross += dec(
-            fill["realizedPnl"]
-        )
-
-        fee_raw = (
-            fill.get("fee")
-            if fill.get("fee") is not None
-            else fill.get("commission")
-        )
-
-        if fee_raw is None:
-            raise RuntimeError(
-                "BingX no devolvió las "
-                "comisiones de una ejecución"
-            )
-
-        fees += abs(dec(fee_raw))
-
-    if qty <= 0:
-        raise RuntimeError(
-            "Cantidad ejecutada igual a cero"
-        )
-
-    return {
-        "qty": qty,
-        "price": weighted / qty,
-        "gross": gross,
-        "fees": fees,
-    }
-
-
-# ============================================================
-# CONCILIAR PNL DE UNA OPERACIÓN
-# ============================================================
-
-def reconcile_one(trade):
-    if not trade.get("pnl_pending"):
-        return None
-
-    if trade.get(
-        "symbol", SYMBOL
-    ) != SYMBOL:
-        raise RuntimeError(
-            "El símbolo de la operación "
-            "no coincide con WTI"
-        )
-
-    start = epoch_ms(
-        trade.get("opened_at")
-    )
-
-    end = epoch_ms(
-        trade.get("closed_at")
-    )
-
-    if (
-        not start
-        or not end
-        or end < start
-    ):
-        raise RuntimeError(
-            "Fechas incompletas para conciliar"
-        )
-
-    open_id = str(
-        trade.get("open_order_id")
-        or ""
-    )
-
-    close_id = str(
-        trade.get("close_order_id")
-        or ""
-    )
-
-    if not close_id:
-        raise RuntimeError(
-            "No hay ID de orden de cierre "
-            "para asociar PnL"
-        )
-
-    if not open_id:
-        open_id = resolve_old_open_id(
-            trade
-        )
-
-    if not open_id:
-        raise RuntimeError(
-            "No se identificó de forma "
-            "única la orden de entrada"
-        )
-
-    order_a = bingx.order_detail(
-        open_id
-    )
-
-    order_b = bingx.order_detail(
-        close_id
-    )
-
-    if (
-        order_key(order_a) != open_id
-        or order_key(order_b) != close_id
-        or str(
-            order_a.get("status", "")
-        ).upper() != "FILLED"
-        or str(
-            order_b.get("status", "")
-        ).upper() != "FILLED"
-    ):
-        raise RuntimeError(
-            "BingX aún no confirmó ambas "
-            "órdenes como FILLED"
-        )
-
-    if (
-        str(
-            order_a.get(
-                "symbol", SYMBOL
-            )
-        ).upper() != SYMBOL
-        or str(
-            order_b.get(
-                "symbol", SYMBOL
-            )
-        ).upper() != SYMBOL
-    ):
-        raise RuntimeError(
-            "ID de orden pertenece "
-            "a otro símbolo"
-        )
-
-    if (
-        str(
-            order_a.get(
-                "positionSide",
-                trade["side"],
-            )
-        ).upper() != trade["side"]
-        or str(
-            order_b.get(
-                "positionSide",
-                trade["side"],
-            )
-        ).upper() != trade["side"]
-    ):
-        raise RuntimeError(
-            "La dirección del trade no "
-            "coincide con las órdenes"
-        )
-
-    start_ms = max(
-        0,
-        start - 300000,
-    )
-
-    end_ms = min(
-        int(time.time() * 1000),
-        end + 300000,
-    )
-
-    a = confirmed_fill_summary(
-        bingx.fills(
-            open_id,
-            start_ms,
-            end_ms,
-        )
-    )
-
-    b = confirmed_fill_summary(
-        bingx.fills(
-            close_id,
-            start_ms,
-            end_ms,
-        )
-    )
-
-    tolerance = max(
-        0.00001,
-        number(
-            trade.get("quantity")
-        ) * 0.001,
-    )
-
-    if abs(
-        float(
-            a["qty"] - b["qty"]
-        )
-    ) > tolerance:
-        raise RuntimeError(
-            "Cantidades apertura/cierre "
-            "no coinciden"
-        )
-
-    if abs(
-        float(a["qty"])
-        - number(
-            trade.get("quantity")
-        )
-    ) > tolerance:
-        raise RuntimeError(
-            "Cantidad de fills no coincide "
-            "con la posición guardada"
-        )
-
-    funding = dec(
-        bingx.funding(
-            start,
-            end,
-        )
-    )
-
-    gross = (
-        b["gross"] + a["gross"]
-    )
-
-    fees = (
-        a["fees"] + b["fees"]
-    )
-
-    net = (
-        gross - fees + funding
-    )
-
-    entry = float(a["price"])
-    exit_price = float(b["price"])
-
+def apply_position_pnl(trade, p):
+    """Usa netProfit final; NO vuelve a descontar comisión/funding."""
+    net = dec(p['netProfit'])
+    gross_val = p.get('realisedProfit')
+    if gross_val is None:
+        gross_val = p.get('realizedProfit')
+    if gross_val is None:
+        raise RuntimeError('BingX no proporcionó realisedProfit')
+    gross = dec(gross_val)
+    commission_raw = p.get('positionCommission')
+    if commission_raw is None:
+        raise RuntimeError('BingX no proporcionó positionCommission')
+    funding_raw = p.get('totalFunding')
+    if funding_raw is None:
+        raise RuntimeError('BingX no proporcionó totalFunding')
+    # Comisión siempre se muestra como costo positivo.
+    fees = abs(dec(commission_raw))
+    funding = dec(funding_raw)
+    entry = number(p.get('avgPrice'))
+    exit_price = number(p.get('avgClosePrice'))
     if entry <= 0 or exit_price <= 0:
-        raise RuntimeError(
-            "Precio de ejecución inválido"
-        )
-
-    updated = dict(trade)
-
-    updated.update({
-        "open_order_id": open_id,
-        "exit_price": exit_price,
-        "entry_price": entry,
-        "gross_pnl": float(gross),
-        "total_fees": float(fees),
-        "funding": float(funding),
-        "net_pnl": float(net),
-        "pnl_pending": False,
-        "pnl_source": (
-            "BINGX_FILLS_AND_FUNDING"
-        ),
-        "price_move_pct": (
-            (exit_price - entry)
-            / entry
-            * 100
-            * (
-                1
-                if trade["side"] == "LONG"
-                else -1
-            )
-        ),
+        raise RuntimeError('Precios de historial de posición incompletos')
+    out = dict(trade)
+    out.update({
+        'position_id': str(p.get('positionId') or ''),
+        'entry_price': entry,
+        'exit_price': exit_price,
+        'gross_pnl': float(gross),
+        'total_fees': float(fees),
+        'funding': float(funding),
+        'net_pnl': float(net),
+        'pnl_pending': False,
+        'pnl_source': 'BINGX_POSITION_HISTORY',
+        'pnl_confirmed_at': now(),
+        'position_fingerprint': position_fingerprint(p),
+        'price_move_pct': (exit_price - entry) / entry * 100 * (1 if trade['side'] == 'LONG' else -1),
     })
+    risk = number(trade.get('risk_usd'))
+    out['r_multiple'] = float(net) / risk if risk > 0 else 0
+    return out
 
-    risk = number(
-        trade.get("risk_usd")
-    )
-
-    updated["r_multiple"] = (
-        float(net) / risk
-        if risk > 0
-        else 0
-    )
-
-    return updated
-
-
-# ============================================================
-# ACTUALIZAR OPERACIONES PENDIENTES
-# ============================================================
 
 def reconcile_pending(force=False):
-    """
-    Solo consulta datos en BingX.
-    No abre ni cierra posiciones.
-    Actualiza el registro original
-    sin duplicar operaciones.
-    """
-
+    """Una sola lectura del historial real, actualizaciones sin duplicados."""
     with LOCK:
-        previous = number(
-            store.get(
-                "last_reconcile", 0
-            )
-        )
-
-        if (
-            not force
-            and time.time() - previous < 20
-        ):
-            return {
-                "checked": False,
-                "reason": "cooldown",
-            }
-
-        store.set(
-            "last_reconcile",
-            time.time(),
-        )
-
+        prev = number(store.get('last_reconcile', 0))
+        if not force and time.time() - prev < 30:
+            return {'checked': False, 'reason': 'cooldown'}
+        store.set('last_reconcile', time.time())
         trades = store.trades()
-
-        changed = 0
-        waiting = []
-
-        for index, item in enumerate(
-            trades
-        ):
-            if not item.get(
-                "pnl_pending"
-            ):
+        pending = [(i, t) for i, t in enumerate(trades) if t.get('pnl_pending')]
+        if not pending:
+            return {'checked': True, 'confirmed': 0, 'pending': 0, 'reasons': []}
+        starts = [epoch_ms(t.get('opened_at')) for _, t in pending]
+        ends = [epoch_ms(t.get('closed_at')) for _, t in pending]
+        if not all(starts) or not all(ends):
+            return {'checked': True, 'confirmed': 0, 'pending': len(pending), 'reasons': ['Una operación tiene fecha inválida']}
+        # Un periodo pequeño, específico de las operaciones pendientes.
+        begin = max(0, min(starts) - 60 * 60 * 1000)
+        finish = min(int(time.time() * 1000), max(ends) + 60 * 60 * 1000)
+        if finish - begin > 89 * 86400000:
+            raise RuntimeError('El rango de historial supera el máximo seguro de BingX')
+        positions = bingx.position_history(begin, finish)
+        used = set()
+        for t in trades:
+            if t.get('pnl_pending'):
                 continue
-
+            if t.get('position_fingerprint'):
+                used.add(t['position_fingerprint'])
+            elif t.get('position_id'):
+                used.add('position:' + str(t['position_id']))
+        changed, waiting = 0, []
+        for index, original in pending:
             try:
-                complete = reconcile_one(
-                    item
-                )
-
-                if complete:
-                    trades[index] = complete
-
-                    store.set(
-                        "trades",
-                        trades,
-                    )
-
-                    changed += 1
-
-                    store.event(
-                        "PNL_CONFIRMED",
-                        (
-                            f"{item.get('side')} "
-                            f"neto "
-                            f"{complete['net_pnl']:+.4f} "
-                            "USDT"
-                        ),
-                    )
-
-                    telegram(
-                        f"{BOT_NAME}\n"
-                        "PnL confirmado: "
-                        f"{complete['net_pnl']:+.4f} "
-                        "USDT"
-                    )
-
+                p = match_position(original, positions, used)
+                complete = apply_position_pnl(original, p)
+                used.add(position_fingerprint(p))
+                trades[index] = complete
+                store.set('trades', trades)
+                changed += 1
+                store.event('PNL_CONFIRMED', f'{complete["side"]} neto {complete["net_pnl"]:+.4f} USDT')
+                telegram(f'{BOT_NAME}\nPnL real confirmado: {complete["net_pnl"]:+.4f} USDT')
             except Exception as exc:
-                waiting.append(
-                    safe_error(exc)
-                )
+                waiting.append(safe_error(exc))
+        # No muestra identificadores privados ni registros de la cuenta.
+        if waiting:
+            store.event('PNL_DIAGNOSTIC', f'Posiciones consultadas: {len(positions)}; campos: {sorted(positions[0].keys()) if positions and isinstance(positions[0], dict) else []}')
+        return {'checked': True, 'confirmed': changed, 'pending': len(waiting), 'reasons': waiting[:5]}
 
-        return {
-            "checked": True,
-            "confirmed": changed,
-            "pending": len(waiting),
-            "reasons": waiting[:5],
-        }
-
-
-# ============================================================
-# CUATRO SEÑALES TRADINGVIEW
-# ============================================================
 
 def process_signal(action):
     mode = store.mode()
+    if mode == 'OFF':
+        return {'status': 'ignored', 'reason': 'mode_off'}
+    if action == 'XL':
+        return close_trade('LONG', 'tradingview_XL_3m')
+    if action == 'XS':
+        return close_trade('SHORT', 'tradingview_XS_3m')
+    if action == 'LONG' and mode in ('LONG_ONLY', 'BOTH'):
+        return open_trade('LONG')
+    if action == 'SHORT' and mode in ('SHORT_ONLY', 'BOTH'):
+        return open_trade('SHORT')
+    return {'status': 'ignored', 'reason': 'mode_disallows_entry'}
 
-    if mode == "OFF":
-        return {
-            "status": "ignored",
-            "reason": "mode_off",
-        }
-
-    if action == "XL":
-        return close_trade(
-            "LONG",
-            "tradingview_XL_3m",
-        )
-
-    if action == "XS":
-        return close_trade(
-            "SHORT",
-            "tradingview_XS_3m",
-        )
-
-    if (
-        action == "LONG"
-        and mode in (
-            "LONG_ONLY", "BOTH"
-        )
-    ):
-        return open_trade("LONG")
-
-    if (
-        action == "SHORT"
-        and mode in (
-            "SHORT_ONLY", "BOTH"
-        )
-    ):
-        return open_trade("SHORT")
-
-    return {
-        "status": "ignored",
-        "reason": "mode_disallows_entry",
-    }
-
-
-# ============================================================
-# NORMALIZACIÓN DE OPERACIONES
-# ============================================================
 
 def normalize_trade(item):
     t = dict(item)
-
-    side = str(
-        t.get("side", "")
-    ).upper()
-
-    if side not in (
-        "LONG", "SHORT"
-    ):
-        raise ValueError(
-            "Dirección inválida"
-        )
-
-    t.setdefault(
-        "id",
-        str(uuid.uuid4()),
-    )
-
-    t.setdefault(
-        "opened_at", now()
-    )
-
-    t.setdefault(
-        "closed_at", now()
-    )
-
-    t.setdefault(
-        "symbol", SYMBOL
-    )
-
-    t.setdefault(
-        "source", "MANUAL"
-    )
-
-    for key in (
-        "entry_price",
-        "exit_price",
-        "quantity",
-        "margin_used",
-        "leverage",
-        "gross_pnl",
-        "total_fees",
-        "funding",
-        "risk_usd",
-    ):
-        t[key] = number(
-            t.get(key)
-        )
-
-    t["net_pnl"] = number(
-        t.get(
-            "net_pnl",
-            (
-                t["gross_pnl"]
-                - t["total_fees"]
-                + t["funding"]
-            ),
-        )
-    )
-
-    t["r_multiple"] = (
-        t["net_pnl"]
-        / t["risk_usd"]
-        if t["risk_usd"]
-        else 0
-    )
-
-    t["price_move_pct"] = (
-        (
-            t["exit_price"]
-            - t["entry_price"]
-        )
-        / t["entry_price"]
-        * 100
-        * (
-            1
-            if side == "LONG"
-            else -1
-        )
-        if (
-            t["entry_price"]
-            and t["exit_price"]
-        )
-        else 0
-    )
-
-    t["pnl_pending"] = bool(
-        t.get(
-            "pnl_pending",
-            False,
-        )
-    )
-
+    side = str(t.get('side', '')).upper()
+    if side not in ('LONG', 'SHORT'):
+        raise ValueError('Dirección inválida')
+    t.setdefault('id', str(uuid.uuid4()))
+    t.setdefault('opened_at', now())
+    t.setdefault('closed_at', now())
+    t.setdefault('symbol', SYMBOL)
+    t.setdefault('source', 'MANUAL')
+    for key in ('entry_price', 'exit_price', 'quantity', 'margin_used', 'leverage', 'gross_pnl', 'total_fees', 'funding', 'risk_usd'):
+        t[key] = number(t.get(key))
+    t['net_pnl'] = number(t.get('net_pnl', t['gross_pnl'] - t['total_fees'] + t['funding']))
+    t['r_multiple'] = t['net_pnl'] / t['risk_usd'] if t['risk_usd'] else 0
+    t['price_move_pct'] = ((t['exit_price'] - t['entry_price']) / t['entry_price'] * 100 * (1 if side == 'LONG' else -1)) if t['entry_price'] and t['exit_price'] else 0
+    t['pnl_pending'] = bool(t.get('pnl_pending', False))
     return t
 
 
-# ============================================================
-# ESTADÍSTICAS COMPLETAS
-# ============================================================
-
 def summary(trades):
-    done = [
-        t for t in trades
-        if not t.get(
-            "pnl_pending"
-        )
-    ]
-
-    pnl = [
-        number(
-            t.get("net_pnl")
-        )
-        for t in done
-    ]
-
-    wins = [
-        p for p in pnl
-        if p > 0.000001
-    ]
-
-    losses = [
-        p for p in pnl
-        if p < -0.000001
-    ]
-
+    done = [t for t in trades if not t.get('pnl_pending')]
+    pnl = [number(t.get('net_pnl')) for t in done]
+    wins = [p for p in pnl if p > 0.000001]
+    losses = [p for p in pnl if p < -0.000001]
     curve = [0.0]
-
-    peak = 0.0
-    dd = 0.0
-
-    longest_win = 0
-    longest_loss = 0
-    win_streak = 0
-    loss_streak = 0
-
+    peak = dd = 0.0
+    longest_win = longest_loss = win_streak = loss_streak = 0
     for p in pnl:
-        curve.append(
-            curve[-1] + p
-        )
-
-        peak = max(
-            peak, curve[-1]
-        )
-
-        dd = max(
-            dd,
-            peak - curve[-1],
-        )
-
-        win_streak = (
-            win_streak + 1
-            if p > 0.000001
-            else 0
-        )
-
-        loss_streak = (
-            loss_streak + 1
-            if p < -0.000001
-            else 0
-        )
-
-        longest_win = max(
-            longest_win,
-            win_streak,
-        )
-
-        longest_loss = max(
-            longest_loss,
-            loss_streak,
-        )
-
-    longs = [
-        t for t in done
-        if t.get("side")
-        == "LONG"
-    ]
-
-    shorts = [
-        t for t in done
-        if t.get("side")
-        == "SHORT"
-    ]
-
+        curve.append(curve[-1] + p)
+        peak = max(peak, curve[-1]); dd = max(dd, peak - curve[-1])
+        win_streak = win_streak + 1 if p > 0.000001 else 0
+        loss_streak = loss_streak + 1 if p < -0.000001 else 0
+        longest_win = max(longest_win, win_streak); longest_loss = max(longest_loss, loss_streak)
+    longs = [t for t in done if t.get('side') == 'LONG']
+    shorts = [t for t in done if t.get('side') == 'SHORT']
     return {
-        "count": len(trades),
-        "confirmed": len(done),
-        "pending": (
-            len(trades) - len(done)
-        ),
-        "wins": len(wins),
-        "losses": len(losses),
-        "be": (
-            len(done)
-            - len(wins)
-            - len(losses)
-        ),
-        "winrate": (
-            100 * len(wins) / len(done)
-            if done else 0
-        ),
-        "net": sum(pnl),
-        "gross": sum(
-            number(
-                t.get("gross_pnl")
-            )
-            for t in done
-        ),
-        "fees": sum(
-            number(
-                t.get("total_fees")
-            )
-            for t in done
-        ),
-        "funding": sum(
-            number(
-                t.get("funding")
-            )
-            for t in done
-        ),
-        "pf": (
-            sum(wins) / abs(sum(losses))
-            if losses
-            else (
-                999
-                if wins else 0
-            )
-        ),
-        "max_dd": dd,
-        "curve": curve,
-        "long_count": len(longs),
-        "short_count": len(shorts),
-        "long_net": sum(
-            number(
-                t.get("net_pnl")
-            )
-            for t in longs
-        ),
-        "short_net": sum(
-            number(
-                t.get("net_pnl")
-            )
-            for t in shorts
-        ),
-        "best": max(
-            pnl, default=0
-        ),
-        "worst": min(
-            pnl, default=0
-        ),
-        "avg_win": (
-            sum(wins) / len(wins)
-            if wins else 0
-        ),
-        "avg_loss": (
-            sum(losses) / len(losses)
-            if losses else 0
-        ),
-        "max_win_streak": longest_win,
-        "max_loss_streak": longest_loss,
-        "r_total": sum(
-            number(
-                t.get("r_multiple")
-            )
-            for t in done
-        ),
+        'count': len(trades), 'confirmed': len(done), 'pending': len(trades) - len(done),
+        'wins': len(wins), 'losses': len(losses), 'be': len(done) - len(wins) - len(losses),
+        'winrate': 100 * len(wins) / len(done) if done else 0,
+        'net': sum(pnl), 'gross': sum(number(t.get('gross_pnl')) for t in done),
+        'fees': sum(number(t.get('total_fees')) for t in done),
+        'funding': sum(number(t.get('funding')) for t in done),
+        'pf': sum(wins) / abs(sum(losses)) if losses else (999 if wins else 0),
+        'max_dd': dd, 'curve': curve,
+        'long_count': len(longs), 'short_count': len(shorts),
+        'long_net': sum(number(t.get('net_pnl')) for t in longs),
+        'short_net': sum(number(t.get('net_pnl')) for t in shorts),
+        'best': max(pnl, default=0), 'worst': min(pnl, default=0),
+        'avg_win': sum(wins) / len(wins) if wins else 0,
+        'avg_loss': sum(losses) / len(losses) if losses else 0,
+        'max_win_streak': longest_win, 'max_loss_streak': longest_loss,
+        'r_total': sum(number(t.get('r_multiple')) for t in done),
     }
-
-
-# ============================================================
-# PANEL WEB COMPLETO
-# ============================================================
 
 PANEL = r'''<!doctype html>
-<html lang="es">
-<head>
-<meta charset="utf-8">
-<meta name="viewport"
-content="width=device-width,initial-scale=1">
-
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>BOT PETRÓLEO WTI 3M</title>
-
 <style>
-:root {
-    --bg:#070a0f;
-    --panel:#151a21;
-    --inner:#0e1218;
-    --stroke:#2d3541;
-    --white:#f4f7fa;
-    --gray:#a3adbc;
-    --green:#00d489;
-    --red:#fc536b;
-    --blue:#3977e9;
-    --gold:#cfa01a;
-}
-
-* {
-    box-sizing:border-box;
-}
-
-body {
-    margin:0;
-    background:var(--bg);
-    color:var(--white);
-    font:15px -apple-system,BlinkMacSystemFont,
-    "Segoe UI",sans-serif;
-}
-
-main {
-    max-width:1100px;
-    margin:auto;
-    padding:16px;
-}
-
-.center {
-    text-align:center;
-}
-
-.muted {
-    color:var(--gray);
-}
-
-.green {
-    color:var(--green);
-}
-
-.red {
-    color:var(--red);
-}
-
-.yellow {
-    color:#ffcd6e;
-}
-
-h1 {
-    text-align:center;
-    font-size:32px;
-}
-
-h2 {
-    margin:0 0 18px;
-    font-size:19px;
-}
-
-section {
-    margin:18px 0;
-}
-
-.card {
-    background:var(--panel);
-    border:1px solid var(--stroke);
-    padding:21px;
-    border-radius:23px;
-}
-
-.grid {
-    display:grid;
-    grid-template-columns:repeat(
-        2,minmax(0,1fr)
-    );
-    gap:12px;
-}
-
-.stats {
-    display:grid;
-    grid-template-columns:repeat(
-        4,minmax(0,1fr)
-    );
-    gap:12px;
-}
-
-.stat {
-    background:var(--inner);
-    border:1px solid var(--stroke);
-    border-radius:15px;
-    padding:14px;
-    overflow-wrap:anywhere;
-}
-
-.stat small {
-    display:block;
-    color:var(--gray);
-}
-
-.stat strong {
-    display:block;
-    margin-top:7px;
-    font-size:25px;
-}
-
-.mode {
-    font-size:38px;
-    font-weight:900;
-    color:var(--green);
-    margin:18px auto;
-}
-
-.btn,button {
-    border:0;
-    border-radius:14px;
-    color:white;
-    font-size:16px;
-    font-weight:750;
-    padding:16px 12px;
-    display:block;
-    text-align:center;
-    width:100%;
-    text-decoration:none;
-    cursor:pointer;
-}
-
-.off {
-    background:#606b79;
-}
-
-.long {
-    background:#048856;
-}
-
-.short {
-    background:#bf2945;
-}
-
-.close {
-    background:#3265b9;
-}
-
-.both {
-    background:#b38a0d;
-}
-
-.blue {
-    background:var(--blue);
-}
-
-.dark {
-    background:#343c48;
-}
-
-input,select {
-    width:100%;
-    min-width:0;
-    border:1px solid var(--stroke);
-    background:#0c1116;
-    color:white;
-    padding:13px;
-    border-radius:12px;
-    font-size:15px;
-}
-
-table {
-    border-collapse:collapse;
-    width:100%;
-    font-size:12px;
-}
-
-th,td {
-    border-bottom:1px solid var(--stroke);
-    padding:11px 9px;
-    text-align:left;
-    white-space:nowrap;
-}
-
-.scroll {
-    overflow:auto;
-}
-
-.event {
-    background:#0c1116;
-    border:1px solid var(--stroke);
-    padding:12px;
-    border-radius:12px;
-    margin:7px 0;
-    overflow-wrap:anywhere;
-    font-size:12px;
-}
-
-#curve {
-    display:block;
-    width:100%;
-    height:240px;
-    background:#080c12;
-    border-radius:14px;
-}
-
-@media(max-width:800px) {
-    .stats {
-        grid-template-columns:repeat(
-            2,minmax(0,1fr)
-        );
-    }
-}
-
-@media(max-width:500px) {
-    h1 {
-        font-size:25px;
-    }
-
-    .card {
-        padding:16px;
-    }
-
-    .stat strong {
-        font-size:21px;
-    }
-}
-</style>
-</head>
-
-<body>
-<main>
-
+:root{--bg:#070a0f;--panel:#151a21;--inner:#0e1218;--stroke:#2d3541;--white:#f4f7fa;--gray:#a3adbc;--green:#00d489;--red:#fc536b;--blue:#3977e9;--gold:#cfa01a}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--white);font:15px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+main{max-width:1100px;margin:auto;padding:16px}.center{text-align:center}.muted{color:var(--gray)}.green{color:var(--green)}.red{color:var(--red)}.yellow{color:#ffcd6e}
+h1{text-align:center;font-size:32px}h2{margin:0 0 18px;font-size:19px}section{margin:18px 0}
+.card{background:var(--panel);border:1px solid var(--stroke);padding:21px;border-radius:23px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+.stat{background:var(--inner);border:1px solid var(--stroke);border-radius:15px;padding:14px;overflow-wrap:anywhere}.stat small{display:block;color:var(--gray)}.stat strong{display:block;margin-top:7px;font-size:25px}
+.mode{font-size:38px;font-weight:900;color:var(--green);margin:18px auto}.btn,button{border:0;border-radius:14px;color:white;font-size:16px;font-weight:750;padding:16px 12px;display:block;text-align:center;width:100%;text-decoration:none;cursor:pointer}
+.off{background:#606b79}.long{background:#048856}.short{background:#bf2945}.close{background:#3265b9}.both{background:#b38a0d}.blue{background:var(--blue)}.dark{background:#343c48}
+input,select{width:100%;min-width:0;border:1px solid var(--stroke);background:#0c1116;color:white;padding:13px;border-radius:12px;font-size:15px}
+table{border-collapse:collapse;width:100%;font-size:12px}th,td{border-bottom:1px solid var(--stroke);padding:11px 9px;text-align:left;white-space:nowrap}.scroll{overflow:auto}.event{background:#0c1116;border:1px solid var(--stroke);padding:12px;border-radius:12px;margin:7px 0;overflow-wrap:anywhere;font-size:12px}
+#curve{display:block;width:100%;height:240px;background:#080c12;border-radius:14px}
+@media(max-width:800px){.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:500px){h1{font-size:25px}.card{padding:16px}.stat strong{font-size:21px}}
+</style></head><body><main>
 <h1>🛢 BOT PETRÓLEO WTI 3M</h1>
-
-<p class="center muted">
-{{symbol}} · 3M · {{leverage}}x · ISOLATED ·
-{{percent}}% del balance · REAL
-</p>
-
-<section class="card center">
-    <span class="muted">MODO ACTUAL</span>
-    <div class="mode">{{mode_label}}</div>
-</section>
-
+<p class="center muted">{{symbol}} · 3M · {{leverage}}x · ISOLATED · {{percent}}% del balance · REAL</p>
+<section class="card center"><span class="muted">MODO ACTUAL</span><div class="mode">{{mode_label}}</div></section>
 <section class="grid">
-
-{% for code,label,style in modes %}
-<form method="post"
-action="/setmode/{{code}}?secret={{secret}}">
-    <button class="{{style}}">
-        {{label}}
-    </button>
-</form>
-{% endfor %}
-
-<a class="btn blue"
-href="/diagnostic?secret={{secret}}">
-    PROBAR BINGX
-</a>
-
-<form method="post"
-action="/sync?secret={{secret}}">
-    <button class="blue">
-        SINCRONIZAR
-    </button>
-</form>
+{% for code,label,style in modes %}<form method="post" action="/setmode/{{code}}?secret={{secret}}"><button class="{{style}}">{{label}}</button></form>{% endfor %}
+<a class="btn blue" href="/diagnostic?secret={{secret}}">PROBAR BINGX</a>
+<form method="post" action="/sync?secret={{secret}}"><button class="blue">SINCRONIZAR</button></form>
 
 </section>
-
-<section class="card">
-<h2>Posición real en BingX</h2>
-
-{% if warning %}
-<p class="yellow">{{warning}}</p>
-{% endif %}
-
-{% if live %}
-<h2 class="{{'green' if live.side=='LONG' else 'red'}}">
-    {{live.side}} · {{live.quantity}} contratos
-</h2>
-
-<p>
-    Entrada: {{live.entry_price}} ·
-    Apalancamiento: {{live.leverage}}x ·
-    PnL flotante:
-    {{'%.4f'|format(live.unrealized_pnl)}} USDT
-</p>
-{% elif not warning %}
-<p class="muted">
-    FLAT · Sin posición WTI abierta
-</p>
-{% endif %}
+<section class="card"><h2>Posición real en BingX</h2>
+{% if warning %}<p class="yellow">{{warning}}</p>{% endif %}
+{% if live %}<h2 class="{{'green' if live.side=='LONG' else 'red'}}">{{live.side}} · {{live.quantity}} contratos</h2>
+<p>Entrada: {{live.entry_price}} · Apalancamiento: {{live.leverage}}x · PnL flotante: {{'%.4f'|format(live.unrealized_pnl)}} USDT</p>
+{% elif not warning %}<p class="muted">FLAT · Sin posición WTI abierta</p>{% endif %}</section>
+<section class="card"><h2>Curva de rendimiento confirmado</h2>
+<h1 class="{{'green' if stats.net>=0 else 'red'}}">{{'%+.4f'|format(stats.net)}} USDT</h1>
+<svg id="curve" viewBox="0 0 1000 260" preserveAspectRatio="none"></svg>
 </section>
+<section class="card"><h2>Estadísticas · Histórico WTI</h2>
+<div class="stats">{% for label,value in cards %}<div class="stat"><small>{{label}}</small><strong>{{value}}</strong></div>{% endfor %}</div>
+{% if stats.pending %}<p class="yellow">{{stats.pending}} operación(es) pendientes de datos confirmados por BingX. Pulsa SINCRONIZAR para comprobar los resultados reales en BingX.</p>{% endif %}</section>
+<section class="card"><h2>Agregar operación manual</h2>
+<form class="grid" method="post" action="/manual-trade?secret={{secret}}">
+<select name="side"><option>LONG</option><option>SHORT</option></select>
+<input name="entry_price" type="number" step="any" placeholder="Precio de entrada" required>
+<input name="exit_price" type="number" step="any" placeholder="Precio de cierre" required>
+<input name="quantity" type="number" step="any" placeholder="Cantidad">
+<input name="margin_used" type="number" step="any" placeholder="Margen en USDT">
+<input name="gross_pnl" type="number" step="any" placeholder="PnL bruto real">
+<input name="net_pnl" type="number" step="any" placeholder="PnL neto real">
+<input name="fees" type="number" step="any" placeholder="Comisiones">
+<input name="funding" type="number" step="any" placeholder="Funding firmado">
+<input name="risk_usd" type="number" step="any" placeholder="Riesgo en USDT">
+<input name="opened_at" type="datetime-local"><input name="closed_at" type="datetime-local">
+<input name="notes" placeholder="Notas"><button class="long">AGREGAR OPERACIÓN</button>
+</form></section>
+<section class="card"><h2>Importar historial JSON</h2>
+<form class="grid" method="post" enctype="multipart/form-data" action="/import-json?secret={{secret}}">
+<input type="file" name="file" accept=".json,application/json" required>
+<select name="mode"><option value="append">AGREGAR</option><option value="replace">REEMPLAZAR</option></select><button class="blue">IMPORTAR</button></form></section>
+<section class="grid"><a class="btn dark" href="/download?secret={{secret}}">DESCARGAR CSV</a><a class="btn dark" href="/export-json?secret={{secret}}">EXPORTAR JSON</a></section>
+<section class="card scroll"><h2>Historial de operaciones</h2>
+<table><thead><tr><th>Cierre</th><th>Dirección</th><th>Origen</th><th>Entrada</th><th>Salida</th><th>Movimiento</th><th>Margen</th><th>Comisiones</th><th>Funding</th><th>PnL neto</th><th>R</th><th>Motivo</th></tr></thead>
+<tbody>{% for t in trades %}<tr>
+<td>{{t.closed_at[:19]}}</td><td>{{t.side}}</td><td>{{t.source}}</td>
+<td>{{'%.4f'|format(t.entry_price)}}</td>
+<td>{{'%.4f'|format(t.exit_price) if t.exit_price else 'Pendiente'}}</td>
+<td>{{'%.3f'|format(t.price_move_pct)}}%</td>
+<td>${{'%.2f'|format(t.margin_used)}}</td><td>${{'%.4f'|format(t.total_fees)}}</td><td>{{'%+.4f'|format(t.funding)}}</td>
+<td class="{{'green' if t.net_pnl>=0 else 'red'}}">{{'Pendiente' if t.pnl_pending else '%+.4f'|format(t.net_pnl)}}</td>
+<td>{{'%.2f'|format(t.r_multiple)}}R</td><td>{{t.close_reason}}</td></tr>
+{% else %}<tr><td colspan="12" class="muted">No hay operaciones registradas.</td></tr>{% endfor %}</tbody></table></section>
+<section class="card"><h2>Últimos eventos</h2>{% for e in events %}<div class="event">{{e.time[:19]}} · {{e.kind}} · {{e.detail}}</div>{% else %}<p class="muted">Sin eventos.</p>{% endfor %}</section>
+</main><script>
+const v={{stats.curve|tojson}};const s=document.getElementById('curve');
+if(v.length){const mn=Math.min(0,...v),mx=Math.max(0,...v),span=mx-mn||1;
+const x=i=>v.length==1?500:25+i/(v.length-1)*950;const y=p=>234-(p-mn)/span*204;
+const pts=v.map((p,i)=>`${x(i)},${y(p)}`).join(' ');
+s.innerHTML=`<line x1="25" y1="${y(0)}" x2="975" y2="${y(0)}" stroke="#38414c" stroke-dasharray="6 5"/><polyline points="${pts}" fill="none" stroke="#eef3fa" stroke-width="4"/>`;}
+</script></body></html>'''
 
-<section class="card">
-<h2>Curva de rendimiento confirmado</h2>
-
-<h1 class="{{'green' if stats.net>=0 else 'red'}}">
-    {{'%+.4f'|format(stats.net)}} USDT
-</h1>
-
-<svg id="curve"
-viewBox="0 0 1000 260"
-preserveAspectRatio="none"></svg>
-</section>
-
-<section class="card">
-<h2>Estadísticas · Histórico WTI</h2>
-
-<div class="stats">
-{% for label,value in cards %}
-<div class="stat">
-    <small>{{label}}</small>
-    <strong>{{value}}</strong>
-</div>
-{% endfor %}
-</div>
-
-{% if stats.pending %}
-<p class="yellow">
-    {{stats.pending}} operación(es) pendientes
-    de datos confirmados por BingX.
-    Pulsa SINCRONIZAR para comprobar
-    los resultados reales.
-</p>
-{% endif %}
-</section>
-
-<section class="card">
-<h2>Agregar operación manual</h2>
-
-<form class="grid" method="post"
-action="/manual-trade?secret={{secret}}">
-
-<select name="side">
-    <option>LONG</option>
-    <option>SHORT</option>
-</select>
-
-<input name="entry_price"
-type="number" step="any"
-placeholder="Precio de entrada" required>
-
-<input name="exit_price"
-type="number" step="any"
-placeholder="Precio de cierre" required>
-
-<input name="quantity"
-type="number" step="any"
-placeholder="Cantidad">
-
-<input name="margin_used"
-type="number" step="any"
-placeholder="Margen en USDT">
-
-<input name="gross_pnl"
-type="number" step="any"
-placeholder="PnL bruto real">
-
-<input name="net_pnl"
-type="number" step="any"
-placeholder="PnL neto real">
-
-<input name="fees"
-type="number" step="any"
-placeholder="Comisiones">
-
-<input name="funding"
-type="number" step="any"
-placeholder="Funding firmado">
-
-<input name="risk_usd"
-type="number" step="any"
-placeholder="Riesgo en USDT">
-
-<input name="opened_at"
-type="datetime-local">
-
-<input name="closed_at"
-type="datetime-local">
-
-<input name="notes"
-placeholder="Notas">
-
-<button class="long">
-    AGREGAR OPERACIÓN
-</button>
-
-</form>
-</section>
-
-<section class="card">
-<h2>Importar historial JSON</h2>
-
-<form class="grid"
-method="post"
-enctype="multipart/form-data"
-action="/import-json?secret={{secret}}">
-
-<input type="file" name="file"
-accept=".json,application/json" required>
-
-<select name="mode">
-    <option value="append">AGREGAR</option>
-    <option value="replace">REEMPLAZAR</option>
-</select>
-
-<button class="blue">
-    IMPORTAR
-</button>
-
-</form>
-</section>
-
-<section class="grid">
-
-<a class="btn dark"
-href="/download?secret={{secret}}">
-    DESCARGAR CSV
-</a>
-
-<a class="btn dark"
-href="/export-json?secret={{secret}}">
-    EXPORTAR JSON
-</a>
-
-</section>
-
-<section class="card scroll">
-<h2>Historial de operaciones</h2>
-
-<table>
-<thead>
-<tr>
-    <th>Cierre</th>
-    <th>Dirección</th>
-    <th>Origen</th>
-    <th>Entrada</th>
-    <th>Salida</th>
-    <th>Movimiento</th>
-    <th>Margen</th>
-    <th>Comisiones</th>
-    <th>Funding</th>
-    <th>PnL neto</th>
-    <th>R</th>
-    <th>Motivo</th>
-</tr>
-</thead>
-
-<tbody>
-{% for t in trades %}
-<tr>
-<td>{{t.closed_at[:19]}}</td>
-<td>{{t.side}}</td>
-<td>{{t.source}}</td>
-
-<td>
-{{'%.4f'|format(t.entry_price)}}
-</td>
-
-<td>
-{{'%.4f'|format(t.exit_price)
-if t.exit_price else 'Pendiente'}}
-</td>
-
-<td>
-{{'%.3f'|format(t.price_move_pct)}}%
-</td>
-
-<td>
-${{'%.2f'|format(t.margin_used)}}
-</td>
-
-<td>
-${{'%.4f'|format(t.total_fees)}}
-</td>
-
-<td>
-{{'%+.4f'|format(t.funding)}}
-</td>
-
-<td class="{{'green' if t.net_pnl>=0 else 'red'}}">
-{{'Pendiente' if t.pnl_pending
-else '%+.4f'|format(t.net_pnl)}}
-</td>
-
-<td>
-{{'%.2f'|format(t.r_multiple)}}R
-</td>
-
-<td>{{t.close_reason}}</td>
-</tr>
-{% else %}
-<tr>
-<td colspan="12" class="muted">
-    No hay operaciones registradas.
-</td>
-</tr>
-{% endfor %}
-</tbody>
-</table>
-</section>
-
-<section class="card">
-<h2>Últimos eventos</h2>
-
-{% for e in events %}
-<div class="event">
-    {{e.time[:19]}} ·
-    {{e.kind}} ·
-    {{e.detail}}
-</div>
-{% else %}
-<p class="muted">
-    Sin eventos.
-</p>
-{% endfor %}
-</section>
-
-</main>
-
-<script>
-const v = {{stats.curve|tojson}};
-const s = document.getElementById('curve');
-
-if (v.length) {
-    const mn = Math.min(0,...v);
-    const mx = Math.max(0,...v);
-    const span = mx-mn || 1;
-
-    const x = i =>
-        v.length == 1
-        ? 500
-        : 25+i/(v.length-1)*950;
-
-    const y = p =>
-        234-(p-mn)/span*204;
-
-    const pts = v.map(
-        (p,i) => `${x(i)},${y(p)}`
-    ).join(' ');
-
-    s.innerHTML = `
-    <line x1="25" y1="${y(0)}"
-    x2="975" y2="${y(0)}"
-    stroke="#38414c"
-    stroke-dasharray="6 5"/>
-    <polyline points="${pts}"
-    fill="none"
-    stroke="#eef3fa"
-    stroke-width="4"/>
-    `;
-}
-</script>
-</body>
-</html>'''
-
-
-# ============================================================
-# AUTORIZACIÓN DEL PANEL
-# ============================================================
 
 def panel_authorized():
-    return auth(
-        request.args.get("secret"),
-        CONTROL_SECRET,
-    )
+    return auth(request.args.get('secret'), CONTROL_SECRET)
 
 
-# ============================================================
-# RUTA PRINCIPAL
-# ============================================================
-
-@app.get("/")
+@app.get('/')
 def root():
-    return (
-        f"{BOT_NAME} | {SYMBOL} | "
-        f"MODE={store.mode()} | REAL",
-        200,
-    )
+    return f'{BOT_NAME} | {SYMBOL} | MODE={store.mode()} | REAL', 200
 
 
-# ============================================================
-# HEALTH
-# ============================================================
-
-@app.get("/health")
+@app.get('/health')
 def health():
-    return jsonify({
-        "ok": True,
-        "bot": BOT_NAME,
-        "symbol": SYMBOL,
-        "mode": store.mode(),
-        "mode_label": MODE_LABELS.get(
-            store.mode(), store.mode()
-        ),
-        "timeframe": "3m",
-        "state_prefix": STATE_PREFIX,
-        "redis": store.redis,
-        "version": "WTI-REAL-PNL-3-UNIFIED-SYNC",
-    })
+    return jsonify({'ok': True, 'bot': BOT_NAME, 'symbol': SYMBOL, 'mode': store.mode(), 'timeframe': '3m', 'state_prefix': STATE_PREFIX, 'redis': store.redis, 'version': 'WTI-REAL-PNL-4-POSITION-HISTORY'})
 
 
-# ============================================================
-# PANEL DE CONTROL
-# ============================================================
-
-@app.get("/control")
+@app.get('/control')
 def control():
     if not panel_authorized():
-        return "Acceso denegado", 403
-
-    warning = ""
+        return 'Acceso denegado', 403
+    warning = ''
     live = None
-
     try:
         live = sync_position()
     except Exception as exc:
-        warning = (
-            "Error consultando posición: "
-            + safe_error(exc)
-        )
-
+        warning = 'Error consultando posición: ' + safe_error(exc)
     try:
         reconcile_pending()
     except Exception as exc:
-        store.event(
-            "PNL_ERROR",
-            safe_error(exc),
-        )
-
-        warning += (
-            " · PnL: "
-            + safe_error(exc)
-        )
-
+        store.event('PNL_ERROR', safe_error(exc))
+        warning += ' · PnL: ' + safe_error(exc)
     trades = store.trades()
     stats = summary(trades)
-
     cards = [
-        ("Operaciones", stats["count"]),
-        ("Confirmadas", stats["confirmed"]),
-        ("Pendientes", stats["pending"]),
-        ("Ganadas", stats["wins"]),
-        ("Perdidas", stats["losses"]),
-        (
-            "Winrate",
-            f"{stats['winrate']:.1f}%",
-        ),
-        (
-            "Profit Factor",
-            f"{stats['pf']:.2f}",
-        ),
-        (
-            "PnL neto",
-            f"${stats['net']:+.4f}",
-        ),
-        (
-            "PnL bruto",
-            f"${stats['gross']:+.4f}",
-        ),
-        (
-            "Comisiones",
-            f"${stats['fees']:.4f}",
-        ),
-        (
-            "Funding",
-            f"${stats['funding']:+.4f}",
-        ),
-        (
-            "Máx. DD",
-            f"${stats['max_dd']:.4f}",
-        ),
-        ("LONG", stats["long_count"]),
-        ("SHORT", stats["short_count"]),
-        (
-            "PnL LONG",
-            f"${stats['long_net']:+.4f}",
-        ),
-        (
-            "PnL SHORT",
-            f"${stats['short_net']:+.4f}",
-        ),
-        (
-            "Mejor trade",
-            f"${stats['best']:+.4f}",
-        ),
-        (
-            "Peor trade",
-            f"${stats['worst']:+.4f}",
-        ),
-        (
-            "Promedio W",
-            f"${stats['avg_win']:+.4f}",
-        ),
-        (
-            "Promedio L",
-            f"${stats['avg_loss']:+.4f}",
-        ),
-        (
-            "Mejor racha W",
-            stats["max_win_streak"],
-        ),
-        (
-            "Peor racha L",
-            stats["max_loss_streak"],
-        ),
-        (
-            "R global",
-            f"{stats['r_total']:.2f}R",
-        ),
+        ('Operaciones', stats['count']), ('Confirmadas', stats['confirmed']), ('Pendientes', stats['pending']),
+        ('Ganadas', stats['wins']), ('Perdidas', stats['losses']), ('Winrate', f"{stats['winrate']:.1f}%"),
+        ('Profit Factor', f"{stats['pf']:.2f}"), ('PnL neto', f"${stats['net']:+.4f}"),
+        ('PnL bruto', f"${stats['gross']:+.4f}"), ('Comisiones', f"${stats['fees']:.4f}"),
+        ('Funding', f"${stats['funding']:+.4f}"), ('Máx. DD', f"${stats['max_dd']:.4f}"),
+        ('LONG', stats['long_count']), ('SHORT', stats['short_count']),
+        ('PnL LONG', f"${stats['long_net']:+.4f}"), ('PnL SHORT', f"${stats['short_net']:+.4f}"),
+        ('Mejor trade', f"${stats['best']:+.4f}"), ('Peor trade', f"${stats['worst']:+.4f}"),
+        ('Promedio W', f"${stats['avg_win']:+.4f}"), ('Promedio L', f"${stats['avg_loss']:+.4f}"),
+        ('Mejor racha W', stats['max_win_streak']), ('Peor racha L', stats['max_loss_streak']),
+        ('R global', f"{stats['r_total']:.2f}R"),
     ]
-
-    normalized = [
-        normalize_trade(t)
-        for t in reversed(trades)
-    ]
-
-    modes = [
-        ("OFF", "OFF", "off"),
-        (
-            "LONG_ONLY",
-            "SOLO LONG",
-            "long",
-        ),
-        (
-            "SHORT_ONLY",
-            "SOLO SHORT",
-            "short",
-        ),
-        (
-            "CLOSE_ONLY",
-            "SOLO CERRAR",
-            "close",
-        ),
-        (
-            "BOTH",
-            "LONG + SHORT",
-            "both",
-        ),
-    ]
-
-    return render_template_string(
-        PANEL,
-        secret=request.args["secret"],
-        symbol=SYMBOL,
-        mode=store.mode(),
-        mode_label=MODE_LABELS.get(
-            store.mode(),
-            store.mode(),
-        ),
-        leverage=LEVERAGE,
-        percent=BALANCE_PERCENT,
-        warning=warning,
-        live=live,
-        modes=modes,
-        stats=stats,
-        cards=cards,
-        trades=normalized,
-        events=list(
-            reversed(
-                store.get(
-                    "events", []
-                )[-15:]
-            )
-        ),
-    )
+    normalized = [normalize_trade(t) for t in reversed(trades)]
+    return render_template_string(PANEL, secret=request.args['secret'], symbol=SYMBOL, mode=store.mode(), mode_label={'BOTH': 'LONG + SHORT', 'LONG_ONLY': 'SOLO LONG', 'SHORT_ONLY': 'SOLO SHORT', 'CLOSE_ONLY': 'SOLO CERRAR', 'OFF': 'OFF'}.get(store.mode(), store.mode()), leverage=LEVERAGE, percent=BALANCE_PERCENT, warning=warning, live=live, modes=[('OFF', 'OFF', 'off'), ('LONG_ONLY', 'SOLO LONG', 'long'), ('SHORT_ONLY', 'SOLO SHORT', 'short'), ('CLOSE_ONLY', 'SOLO CERRAR', 'close'), ('BOTH', 'LONG + SHORT', 'both')], stats=stats, cards=cards, trades=normalized, events=list(reversed(store.get('events', [])[-15:])))
 
 
-# ============================================================
-# CAMBIO DE MODO
-# ============================================================
-
-@app.post("/setmode/<mode>")
+@app.post('/setmode/<mode>')
 def setmode(mode):
     if not panel_authorized():
-        return "No autorizado", 403
-
+        return 'No autorizado', 403
     mode = mode.upper()
-
     if mode not in MODES:
-        return "Modo no válido", 400
-
+        return 'Modo no válido', 400
     with LOCK:
-        store.set(
-            "mode",
-            {
-                "mode": mode,
-                "updated_at": now(),
-            },
-        )
-
-    store.event(
-        "MODE",
-        f"Modo cambiado a {mode}",
-    )
-
-    telegram(
-        f"{BOT_NAME}\n"
-        f"Modo: {MODE_LABELS.get(mode, mode)}"
-    )
-
-    return redirect(
-        "/control?secret="
-        + request.args["secret"]
-    )
+        store.set('mode', {'mode': mode, 'updated_at': now()})
+    store.event('MODE', f'Modo cambiado a {mode}')
+    telegram(f'{BOT_NAME}\nModo: {mode}')
+    return redirect('/control?secret=' + request.args['secret'])
 
 
-# ============================================================
-# BOTÓN ÚNICO SINCRONIZAR
-# POSICIÓN + PNL REAL + HISTORIAL
-# ============================================================
-
-@app.post("/sync")
+@app.post('/sync')
 def sync():
     if not panel_authorized():
-        return "No autorizado", 403
-
+        return 'No autorizado', 403
     with LOCK:
         try:
-            position = sync_position()
-
-            store.event(
-                "SYNC",
-                json.dumps(
-                    position,
-                    ensure_ascii=False,
-                )[:400],
-            )
-
+            store.event('SYNC', json.dumps(sync_position(), ensure_ascii=False)[:400])
         except Exception as exc:
-            store.event(
-                "SYNC_ERROR",
-                safe_error(exc),
-            )
-
+            store.event('SYNC_ERROR', safe_error(exc))
         try:
-            result = reconcile_pending(
-                force=True
-            )
-
-            store.event(
-                "PNL_CHECK",
-                (
-                    f"Confirmadas "
-                    f"{result.get('confirmed', 0)}, "
-                    f"pendientes "
-                    f"{result.get('pending', 0)}; "
-                    f"{result.get('reasons', [])[:1]}"
-                ),
-            )
-
+            result = reconcile_pending(force=True)
+            store.event('PNL_CHECK', f"Confirmadas {result.get('confirmed', 0)}, pendientes {result.get('pending', 0)}; {result.get('reasons', [])[:1]}")
         except Exception as exc:
-            store.event(
-                "PNL_ERROR",
-                safe_error(exc),
-            )
-
-    return redirect(
-        "/control?secret="
-        + request.args["secret"]
-    )
+            store.event('PNL_ERROR', safe_error(exc))
+    return redirect('/control?secret=' + request.args['secret'])
 
 
-# ============================================================
-# DIAGNÓSTICO BINGX
-# ============================================================
-
-@app.get("/diagnostic")
+@app.get('/diagnostic')
 def diagnostic():
     if not panel_authorized():
-        return jsonify({
-            "error": "No autorizado"
-        }), 403
-
-    result = {
-        "bot": BOT_NAME,
-        "symbol": SYMBOL,
-        "mode": store.mode(),
-        "real_trading": True,
-        "time": now(),
-    }
-
+        return jsonify({'error': 'No autorizado'}), 403
+    result = {'bot': BOT_NAME, 'symbol': SYMBOL, 'mode': store.mode(), 'real_trading': True, 'time': now()}
     try:
-        result.update({
-            "price": bingx.price(),
-            "contract": bingx.contract(),
-            "balance_available_usdt": (
-                bingx.balance()
-            ),
-            "positions": bingx.positions(),
-            "hedge_mode": bingx.hedge(),
-            "margin_type": (
-                bingx.margin_type()
-            ),
-            "status": "ok",
-        })
-
+        result.update({'price': bingx.price(), 'contract': bingx.contract(), 'balance_available_usdt': bingx.balance(), 'positions': bingx.positions(), 'hedge_mode': bingx.hedge(), 'margin_type': bingx.margin_type(), 'status': 'ok'})
     except Exception as exc:
-        result["status"] = "error"
-
-        result["error"] = safe_error(
-            exc
-        )
-
-        store.event(
-            "DIAGNOSTIC_ERROR",
-            result["error"],
-        )
-
+        result['status'] = 'error'
+        result['error'] = safe_error(exc)
+        store.event('DIAGNOSTIC_ERROR', result['error'])
         return jsonify(result), 500
-
-    store.event(
-        "DIAGNOSTIC_OK",
-        "Conexión BingX comprobada",
-    )
-
+    store.event('DIAGNOSTIC_OK', 'Conexión BingX comprobada')
     return jsonify(result)
 
 
-# ============================================================
-# OPERACIONES MANUALES
-# ============================================================
-
-@app.post("/manual-trade")
+@app.post('/manual-trade')
 def manual_trade():
     if not panel_authorized():
-        return "No autorizado", 403
-
+        return 'No autorizado', 403
     form = request.form
-
-    if (
-        form.get("net_pnl", "") == ""
-        and form.get("gross_pnl", "") == ""
-    ):
-        return (
-            "Indica PnL real bruto o neto",
-            400,
-        )
-
-    data = {
-        "id": str(uuid.uuid4()),
-        "opened_at": (
-            form.get("opened_at")
-            or now()
-        ),
-        "closed_at": (
-            form.get("closed_at")
-            or now()
-        ),
-        "side": form.get(
-            "side", "LONG"
-        ),
-        "symbol": SYMBOL,
-        "entry_price": form.get(
-            "entry_price"
-        ),
-        "exit_price": form.get(
-            "exit_price"
-        ),
-        "quantity": form.get(
-            "quantity"
-        ),
-        "margin_used": form.get(
-            "margin_used"
-        ),
-        "gross_pnl": form.get(
-            "gross_pnl", 0
-        ),
-        "total_fees": form.get(
-            "fees", 0
-        ),
-        "funding": form.get(
-            "funding", 0
-        ),
-        "risk_usd": form.get(
-            "risk_usd", 0
-        ),
-        "leverage": LEVERAGE,
-        "source": "MANUAL",
-        "close_reason": "manual_panel",
-        "notes": form.get(
-            "notes", ""
-        ),
-    }
-
-    if form.get("net_pnl") not in (
-        None, ""
-    ):
-        data["net_pnl"] = form[
-            "net_pnl"
-        ]
-
-    store.append_trade(
-        normalize_trade(data)
-    )
-
-    return redirect(
-        "/control?secret="
-        + request.args["secret"]
-    )
+    if form.get('net_pnl', '') == '' and form.get('gross_pnl', '') == '':
+        return 'Indica PnL real bruto o neto', 400
+    data = {'id': str(uuid.uuid4()), 'opened_at': form.get('opened_at') or now(), 'closed_at': form.get('closed_at') or now(), 'side': form.get('side', 'LONG'), 'symbol': SYMBOL, 'entry_price': form.get('entry_price'), 'exit_price': form.get('exit_price'), 'quantity': form.get('quantity'), 'margin_used': form.get('margin_used'), 'gross_pnl': form.get('gross_pnl', 0), 'total_fees': form.get('fees', 0), 'funding': form.get('funding', 0), 'risk_usd': form.get('risk_usd', 0), 'leverage': LEVERAGE, 'source': 'MANUAL', 'close_reason': 'manual_panel', 'notes': form.get('notes', '')}
+    if form.get('net_pnl') not in (None, ''):
+        data['net_pnl'] = form['net_pnl']
+    store.append_trade(normalize_trade(data))
+    return redirect('/control?secret=' + request.args['secret'])
 
 
-# ============================================================
-# IMPORTAR HISTORIAL
-# ============================================================
-
-@app.post("/import-json")
+@app.post('/import-json')
 def import_json():
     if not panel_authorized():
-        return "No autorizado", 403
-
-    uploaded = request.files.get(
-        "file"
-    )
-
+        return 'No autorizado', 403
+    uploaded = request.files.get('file')
     if not uploaded:
-        return "Falta JSON", 400
-
+        return 'Falta JSON', 400
     try:
-        payload = json.loads(
-            uploaded.read().decode(
-                "utf-8"
-            )
-        )
-
+        payload = json.loads(uploaded.read().decode('utf-8'))
         if isinstance(payload, dict):
-            if (
-                payload.get("app")
-                and payload["app"]
-                != BOT_NAME
-            ):
-                return (
-                    "Este archivo corresponde "
-                    "a otro bot",
-                    400,
-                )
-
-            records = payload.get(
-                "trades", []
-            )
+            if payload.get('app') and payload['app'] != BOT_NAME:
+                return 'Este archivo corresponde a otro bot', 400
+            records = payload.get('trades', [])
         else:
             records = payload
-
-        if not isinstance(
-            records, list
-        ):
-            raise ValueError(
-                "Se esperaba lista "
-                "de operaciones"
-            )
-
+        if not isinstance(records, list):
+            raise ValueError('Se esperaba lista de operaciones')
         incoming = []
-
         for entry in records:
-            if str(
-                entry.get(
-                    "symbol", SYMBOL
-                )
-            ).upper() != SYMBOL:
-                raise ValueError(
-                    "No se permite historial "
-                    "de otro símbolo"
-                )
-
-            incoming.append(
-                normalize_trade(entry)
-            )
-
+            if str(entry.get('symbol', SYMBOL)).upper() != SYMBOL:
+                raise ValueError('No se permite historial de otro símbolo')
+            incoming.append(normalize_trade(entry))
     except Exception as exc:
-        return (
-            "JSON inválido: "
-            + safe_error(exc),
-            400,
-        )
-
+        return 'JSON inválido: ' + safe_error(exc), 400
     with LOCK:
-        current = (
-            []
-            if request.form.get("mode")
-            == "replace"
-            else store.trades()
-        )
-
-        ids = {
-            str(t.get("id"))
-            for t in current
-        }
-
+        current = [] if request.form.get('mode') == 'replace' else store.trades()
+        ids = {str(t.get('id')) for t in current}
         for trade in incoming:
-            if str(trade["id"]) not in ids:
+            if str(trade['id']) not in ids:
                 current.append(trade)
-                ids.add(
-                    str(trade["id"])
-                )
-
-        store.set(
-            "trades", current
-        )
-
-    return redirect(
-        "/control?secret="
-        + request.args["secret"]
-    )
+                ids.add(str(trade['id']))
+        store.set('trades', current)
+    return redirect('/control?secret=' + request.args['secret'])
 
 
-# ============================================================
-# EXPORTAR JSON
-# ============================================================
-
-@app.get("/export-json")
+@app.get('/export-json')
 def export_json():
     if not panel_authorized():
-        return "No autorizado", 403
-
-    content = json.dumps(
-        {
-            "app": BOT_NAME,
-            "version": 3,
-            "exportedAt": now(),
-            "trades": store.trades(),
-        },
-        ensure_ascii=False,
-        indent=2,
-    ).encode("utf-8")
-
-    return send_file(
-        io.BytesIO(content),
-        mimetype="application/json",
-        as_attachment=True,
-        download_name="wti_3m_historial.json",
-    )
+        return 'No autorizado', 403
+    content = json.dumps({'app': BOT_NAME, 'version': 2, 'exportedAt': now(), 'trades': store.trades()}, ensure_ascii=False, indent=2).encode('utf-8')
+    return send_file(io.BytesIO(content), mimetype='application/json', as_attachment=True, download_name='wti_3m_historial.json')
 
 
-# ============================================================
-# EXPORTAR CSV
-# ============================================================
-
-@app.get("/download")
+@app.get('/download')
 def download():
     if not panel_authorized():
-        return "No autorizado", 403
-
-    cols = [
-        "id",
-        "opened_at",
-        "closed_at",
-        "side",
-        "symbol",
-        "entry_price",
-        "exit_price",
-        "quantity",
-        "leverage",
-        "margin_used",
-        "gross_pnl",
-        "total_fees",
-        "funding",
-        "net_pnl",
-        "pnl_pending",
-        "risk_usd",
-        "r_multiple",
-        "source",
-        "close_reason",
-        "open_order_id",
-        "close_order_id",
-    ]
-
+        return 'No autorizado', 403
+    cols = ['id', 'opened_at', 'closed_at', 'side', 'symbol', 'entry_price', 'exit_price', 'quantity', 'leverage', 'margin_used', 'gross_pnl', 'total_fees', 'funding', 'net_pnl', 'pnl_pending', 'risk_usd', 'r_multiple', 'source', 'close_reason', 'open_order_id', 'close_order_id']
     output = io.StringIO()
-
-    writer = csv.DictWriter(
-        output,
-        fieldnames=cols,
-        extrasaction="ignore",
-    )
-
+    writer = csv.DictWriter(output, fieldnames=cols, extrasaction='ignore')
     writer.writeheader()
-
     for row in store.trades():
         writer.writerow(row)
-
-    return send_file(
-        io.BytesIO(
-            output.getvalue().encode(
-                "utf-8-sig"
-            )
-        ),
-        mimetype="text/csv",
-        as_attachment=True,
-        download_name="wti_3m_historial.csv",
-    )
+    return send_file(io.BytesIO(output.getvalue().encode('utf-8-sig')), mimetype='text/csv', as_attachment=True, download_name='wti_3m_historial.csv')
 
 
-# ============================================================
-# WEBHOOK TRADINGVIEW
-# ============================================================
-
-@app.post("/webhook")
+@app.post('/webhook')
 def webhook():
-    payload = request.get_json(
-        silent=True
-    )
-
-    if not isinstance(
-        payload, dict
-    ):
-        return jsonify({
-            "error": "JSON inválido"
-        }), 400
-
-    if not auth(
-        payload.get("secret"),
-        WEBHOOK_SECRET,
-    ):
-        return jsonify({
-            "error": (
-                "Clave webhook inválida"
-            )
-        }), 403
-
-    action = str(
-        payload.get("action")
-        or payload.get("side")
-        or ""
-    ).upper().strip()
-
-    symbol = str(
-        payload.get("symbol", "")
-    ).upper().strip()
-
-    timeframe = str(
-        payload.get("timeframe", "")
-    ).lower().strip()
-
-    if action not in (
-        "LONG", "SHORT", "XL", "XS"
-    ):
-        return jsonify({
-            "error": (
-                "Usa LONG, SHORT, XL o XS"
-            )
-        }), 400
-
-    if (
-        symbol not in TV_SYMBOLS
-        and symbol != SYMBOL
-    ):
-        return jsonify({
-            "error": (
-                "Símbolo WTI no permitido"
-            ),
-            "symbol": symbol,
-        }), 400
-
-    if timeframe not in (
-        "3", "3m"
-    ):
-        return jsonify({
-            "error": (
-                "Temporalidad debe ser 3M"
-            )
-        }), 400
-
-    stamp = str(
-        payload.get("signal_id")
-        or payload.get("bar_time")
-        or ""
-    ).strip()
-
-    signal = (
-        f"{symbol}:{timeframe}:"
-        f"{action}:{stamp}"
-        if stamp else ""
-    )
-
-    store.event(
-        "WEBHOOK_RECEIVED",
-        f"{action} {symbol} 3M",
-    )
-
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'JSON inválido'}), 400
+    if not auth(payload.get('secret'), WEBHOOK_SECRET):
+        return jsonify({'error': 'Clave webhook inválida'}), 403
+    action = str(payload.get('action') or payload.get('side') or '').upper().strip()
+    symbol = str(payload.get('symbol', '')).upper().strip()
+    timeframe = str(payload.get('timeframe', '')).lower().strip()
+    if action not in ('LONG', 'SHORT', 'XL', 'XS'):
+        return jsonify({'error': 'Usa LONG, SHORT, XL o XS'}), 400
+    if symbol not in TV_SYMBOLS and symbol != SYMBOL:
+        return jsonify({'error': 'Símbolo WTI no permitido', 'symbol': symbol}), 400
+    if timeframe not in ('3', '3m'):
+        return jsonify({'error': 'Temporalidad debe ser 3M'}), 400
+    stamp = str(payload.get('signal_id') or payload.get('bar_time') or '').strip()
+    signal = f'{symbol}:{timeframe}:{action}:{stamp}' if stamp else ''
+    store.event('WEBHOOK_RECEIVED', f'{action} {symbol} 3M')
     try:
         with LOCK:
-            if (
-                signal
-                and store.seen(signal)
-            ):
-                return jsonify({
-                    "ok": True,
-                    "result": {
-                        "status": "ignored",
-                        "reason": (
-                            "duplicate_signal"
-                        ),
-                    },
-                })
-
+            if signal and store.seen(signal):
+                return jsonify({'ok': True, 'result': {'status': 'ignored', 'reason': 'duplicate_signal'}})
             if signal:
                 store.remember(signal)
-
-            result = process_signal(
-                action
-            )
-
-            store.event(
-                "WEBHOOK_PROCESSED",
-                json.dumps(
-                    result,
-                    ensure_ascii=False,
-                )[:450],
-            )
-
-            return jsonify({
-                "ok": True,
-                "result": result,
-            })
-
+            result = process_signal(action)
+            store.event('WEBHOOK_PROCESSED', json.dumps(result, ensure_ascii=False)[:450])
+            return jsonify({'ok': True, 'result': result})
     except Exception as exc:
         message = safe_error(exc)
-
-        store.event(
-            "WEBHOOK_ERROR",
-            message,
-        )
-
-        telegram(
-            f"{BOT_NAME}\n"
-            f"ERROR: {message}"
-        )
-
-        logger.exception(
-            "Webhook error"
-        )
-
-        return jsonify({
-            "ok": False,
-            "error": message,
-        }), 500
+        store.event('WEBHOOK_ERROR', message)
+        telegram(f'{BOT_NAME}\nERROR: {message}')
+        logger.exception('Webhook error')
+        return jsonify({'ok': False, 'error': message}), 500
 
 
-# ============================================================
-# MONITOR
-# ============================================================
-
-@app.get("/monitor")
+@app.get('/monitor')
 def monitor():
-    if not auth(
-        request.args.get("token"),
-        MONITOR_SECRET,
-    ):
-        return jsonify({
-            "error": "No autorizado"
-        }), 403
-
+    if not auth(request.args.get('token'), MONITOR_SECRET):
+        return jsonify({'error': 'No autorizado'}), 403
     try:
         position = sync_position()
-
-        status = {
-            "ok": True,
-            "position": position,
-        }
-
+        status = {'ok': True, 'position': position}
     except Exception as exc:
-        status = {
-            "ok": False,
-            "error": safe_error(exc),
-        }
-
-    return jsonify({
-        "time": now(),
-        "bot": BOT_NAME,
-        "mode": store.mode(),
-        "mode_label": MODE_LABELS.get(
-            store.mode(),
-            store.mode(),
-        ),
-        "sync": status,
-        "active_trade": store.get(
-            "active_trade", None
-        ),
-        "stats": summary(
-            store.trades()
-        ),
-        "events": store.get(
-            "events", []
-        )[-10:],
-    })
+        status = {'ok': False, 'error': safe_error(exc)}
+    return jsonify({'time': now(), 'bot': BOT_NAME, 'mode': store.mode(), 'sync': status, 'active_trade': store.get('active_trade', None), 'stats': summary(store.trades()), 'events': store.get('events', [])[-10:]})
 
 
-# ============================================================
-# INICIO
-# ============================================================
-
-if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=int(
-            os.getenv("PORT", "10000")
-        ),
-    )
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', '10000')))
