@@ -58,11 +58,20 @@ def dec(x):
 
 
 def epoch_ms(value):
-    if isinstance(value, (int, float)):
-        return int(value if value > 10**12 else value * 1000)
+    """BingX devuelve milisegundos numéricos, a veces como texto."""
+    if value is None or isinstance(value, bool):
+        return 0
     try:
-        return int(datetime.fromisoformat(str(value).replace('Z', '+00:00')).timestamp() * 1000)
-    except (TypeError, ValueError):
+        if isinstance(value, (int, float, Decimal)) or (
+            isinstance(value, str) and value.strip().lstrip('+-').isdigit()
+        ):
+            n = int(value)
+            return n if abs(n) > 10**12 else n * 1000
+        dt = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 
@@ -596,53 +605,148 @@ def apply_position_pnl(trade, p):
     return out
 
 
+def income_window(start_ms, end_ms):
+    """Read-only ledger for all symbols; WTI matching is done locally.
+
+    No `symbol` parameter: some non-standard WTI contracts do not appear
+    in symbol-filtered position history. Never log ledger values/IDs.
+    """
+    envelope = bingx.call(
+        'GET', '/openApi/swap/v2/user/income',
+        {
+            'startTime': int(start_ms),
+            'endTime': int(end_ms),
+            'limit': 1000,
+        },
+        envelope=True,
+    )
+    data = envelope.get('data') if isinstance(envelope, dict) else None
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict):
+        rows = None
+        for field in ('income', 'list', 'rows', 'data', 'records', 'items'):
+            if isinstance(data.get(field), list):
+                rows = data[field]
+                break
+    else:
+        rows = None
+    if not isinstance(rows, list) or any(not isinstance(x, dict) for x in rows):
+        store.event('PNL_DIAGNOSTIC', f'income estructura={pnl_shape(data)}')
+        raise RuntimeError('Formato de movimientos BingX desconocido; revisar PNL_DIAGNOSTIC')
+    if len(rows) >= 1000:
+        raise RuntimeError('Historial de movimientos sin paginar (1000+); no se asigna PnL')
+    symbol_rows = [r for r in rows if str(r.get('symbol', '')).upper() == SYMBOL]
+    types = {}
+    for r in symbol_rows:
+        key = str(r.get('incomeType', 'SIN_TIPO'))
+        types[key] = types.get(key, 0) + 1
+    # Only field names and counts; no amount, IDs, balances or private records.
+    store.event('PNL_DIAGNOSTIC',
+                f'income registros_total={len(rows)}, WTI={len(symbol_rows)}, '
+                f'tipos={types}, campos={sorted(rows[0].keys()) if rows else []}')
+    return symbol_rows
+
+
+def reconcile_from_income(trade, all_trades):
+    """Complete one existing pending trade using real USDT ledger flows.
+
+    Require realized PnL at close AND trading fees at both ends. A different
+    WTI trade overlapping this one would make allocation ambiguous.
+    """
+    opened = epoch_ms(trade.get('opened_at'))
+    closed = epoch_ms(trade.get('closed_at'))
+    if not opened or not closed or closed < opened:
+        raise RuntimeError('No hay fechas válidas de apertura y cierre')
+    if str(trade.get('symbol', SYMBOL)).upper() != SYMBOL:
+        raise RuntimeError('El trade pendiente no pertenece a WTI')
+    if str(trade.get('side', '')).upper() not in ('LONG', 'SHORT'):
+        raise RuntimeError('El trade pendiente no tiene dirección')
+    # Older records may lack their original open-order ID. Use only
+    # the non-overlapping window for WTI and require both fee events.
+    for other in all_trades:
+        if str(other.get('id')) == str(trade.get('id')):
+            continue
+        if str(other.get('symbol', SYMBOL)).upper() != SYMBOL:
+            continue
+        other_a = epoch_ms(other.get('opened_at'))
+        other_b = epoch_ms(other.get('closed_at'))
+        if other_a and other_b and other_b >= opened - 45000 and other_a <= closed + 45000:
+            raise RuntimeError('Otra operación WTI solapa la ventana del PnL: asignación ambigua')
+    start = max(0, opened - 30000)
+    end = min(int(time.time() * 1000), closed + 30000)
+    rows = income_window(start, end)
+    acceptable_types = {'REALIZED_PNL', 'TRADING_FEE', 'FUNDING_FEE'}
+    valid = []
+    for r in rows:
+        kind = str(r.get('incomeType', '')).upper()
+        if kind not in acceptable_types:
+            continue
+        if str(r.get('asset', 'USDT')).upper() != 'USDT':
+            continue
+        ms = epoch_ms(r.get('time'))
+        if ms < start or ms > end:
+            continue
+        if r.get('income') is None:
+            raise RuntimeError(f'Movimiento de tipo {kind} sin importe confirmado')
+        valid.append((kind, ms, dec(r['income'])))
+    realized = [(ms, val) for kind, ms, val in valid if kind == 'REALIZED_PNL']
+    fees = [(ms, val) for kind, ms, val in valid if kind == 'TRADING_FEE']
+    funding = [(ms, val) for kind, ms, val in valid if kind == 'FUNDING_FEE']
+    if not realized:
+        raise RuntimeError('Income no devolvió REALIZED_PNL para este cierre')
+    if any(abs(t - closed) > 90000 for t, _ in realized):
+        raise RuntimeError('REALIZED_PNL fuera de la ventana del cierre')
+    if not any(abs(t - opened) < 90000 for t, _ in fees):
+        raise RuntimeError('Falta la comisión real de apertura en income')
+    if not any(abs(t - closed) < 90000 for t, _ in fees):
+        raise RuntimeError('Falta la comisión real de cierre en income')
+    gross = sum((v for _, v in realized), Decimal('0'))
+    fee_signed = sum((v for _, v in fees), Decimal('0'))
+    funding_signed = sum((v for _, v in funding), Decimal('0'))
+    # Ledger fee is signed: negative paid, positive rebate.
+    fee_cost = -fee_signed
+    net = gross + fee_signed + funding_signed
+    result = dict(trade)
+    result.update({
+        'gross_pnl': float(gross),
+        'total_fees': float(fee_cost),
+        'funding': float(funding_signed),
+        'net_pnl': float(net),
+        'pnl_pending': False,
+        'pnl_source': 'BINGX_INCOME_LEDGER',
+        'pnl_confirmed_at': now(),
+    })
+    risk = number(result.get('risk_usd'))
+    result['r_multiple'] = float(net) / risk if risk > 0 else 0
+    return result
+
+
 def reconcile_pending(force=False):
-    """Una sola lectura del historial real, actualizaciones sin duplicados."""
+    """Single-button reconciliation of pending positions. Never duplicates rows."""
     with LOCK:
-        prev = number(store.get('last_reconcile', 0))
-        if not force and time.time() - prev < 30:
+        previous = number(store.get('last_reconcile', 0))
+        if not force and time.time() - previous < 30:
             return {'checked': False, 'reason': 'cooldown'}
         store.set('last_reconcile', time.time())
         trades = store.trades()
         pending = [(i, t) for i, t in enumerate(trades) if t.get('pnl_pending')]
         if not pending:
             return {'checked': True, 'confirmed': 0, 'pending': 0, 'reasons': []}
-        starts = [epoch_ms(t.get('opened_at')) for _, t in pending]
-        ends = [epoch_ms(t.get('closed_at')) for _, t in pending]
-        if not all(starts) or not all(ends):
-            return {'checked': True, 'confirmed': 0, 'pending': len(pending), 'reasons': ['Una operación tiene fecha inválida']}
-        # Un periodo pequeño, específico de las operaciones pendientes.
-        begin = max(0, min(starts) - 60 * 60 * 1000)
-        finish = min(int(time.time() * 1000), max(ends) + 60 * 60 * 1000)
-        if finish - begin > 89 * 86400000:
-            raise RuntimeError('El rango de historial supera el máximo seguro de BingX')
-        positions = bingx.position_history(begin, finish)
-        used = set()
-        for t in trades:
-            if t.get('pnl_pending'):
-                continue
-            if t.get('position_fingerprint'):
-                used.add(t['position_fingerprint'])
-            elif t.get('position_id'):
-                used.add('position:' + str(t['position_id']))
         changed, waiting = 0, []
-        for index, original in pending:
+        for index, trade in pending:
             try:
-                p = match_position(original, positions, used)
-                complete = apply_position_pnl(original, p)
-                used.add(position_fingerprint(p))
+                complete = reconcile_from_income(trade, trades)
                 trades[index] = complete
                 store.set('trades', trades)
                 changed += 1
-                store.event('PNL_CONFIRMED', f'{complete["side"]} neto {complete["net_pnl"]:+.4f} USDT')
+                store.event('PNL_CONFIRMED',
+                            f'{complete["side"]} neto {complete["net_pnl"]:+.4f} USDT')
                 telegram(f'{BOT_NAME}\nPnL real confirmado: {complete["net_pnl"]:+.4f} USDT')
             except Exception as exc:
                 waiting.append(safe_error(exc))
-        # No muestra identificadores privados ni registros de la cuenta.
-        if waiting:
-            store.event('PNL_DIAGNOSTIC', f'Posiciones consultadas: {len(positions)}; campos: {sorted(positions[0].keys()) if positions and isinstance(positions[0], dict) else []}')
-        return {'checked': True, 'confirmed': changed, 'pending': len(waiting), 'reasons': waiting[:5]}
-
+        return {'checked': True, 'confirmed': changed,
+                'pending': len(waiting), 'reasons': waiting[:5]}
 
 def process_signal(action):
     mode = store.mode()
@@ -803,7 +907,7 @@ def root():
 
 @app.get('/health')
 def health():
-    return jsonify({'ok': True, 'bot': BOT_NAME, 'symbol': SYMBOL, 'mode': store.mode(), 'timeframe': '3m', 'state_prefix': STATE_PREFIX, 'redis': store.redis, 'version': 'WTI-REAL-PNL-4-POSITION-HISTORY'})
+    return jsonify({'ok': True, 'bot': BOT_NAME, 'symbol': SYMBOL, 'mode': store.mode(), 'timeframe': '3m', 'state_prefix': STATE_PREFIX, 'redis': store.redis, 'version': 'WTI-REAL-PNL-5-INCOME-LEDGER'})
 
 
 @app.get('/control')
