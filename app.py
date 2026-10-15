@@ -15,10 +15,10 @@ from urllib.parse import urlencode
 import requests
 from flask import Flask, jsonify, redirect, render_template_string, request, send_file
 
-# BOT PETROLEO WTI 3 MIN - ORDENES REALES
+# BOT PETROLEO WTI 5 MIN - ORDENES REALES
 # SHORT/LONG: abren solo si FLAT. XL/XS: cierran el lado correspondiente.
 # Sin reversion automatica, sin TP/SL añadidos, sin simulacion.
-BOT_NAME = 'BOT PETRÓLEO WTI 3M'
+BOT_NAME = 'BOT PETRÓLEO WTI 5M'
 BASE = 'https://open-api.bingx.com'
 SYMBOL = os.getenv('BINGX_SYMBOL', 'NCCO1OILWTI2USD-USDT').strip().upper()
 TV_SYMBOLS = {s.strip().upper() for s in os.getenv('TV_SYMBOLS', 'OILWTIUSDT.P,BINGX:OILWTIUSDT.P,OILWTI-USDT,OILWTIUSDT').split(',') if s.strip()}
@@ -34,13 +34,18 @@ LEVERAGE = int(os.getenv('LEVERAGE', '2'))
 DATA_DIR = os.getenv('DATA_DIR', '.')
 REDIS_URL = os.getenv('UPSTASH_REDIS_REST_URL', '').strip()
 REDIS_TOKEN = os.getenv('UPSTASH_REDIS_REST_TOKEN', '').strip()
-STATE_PREFIX = 'bot_petroleo_wti_3m_v1'  # No cambiar: preserva historial WTI.
+STATE_PREFIX = 'bot_petroleo_wti_5m_v1'  # Historial 5M independiente; el 3M permanece en bot_petroleo_wti_3m_v1.
 MODES = ('OFF', 'LONG_ONLY', 'SHORT_ONLY', 'CLOSE_ONLY', 'BOTH')
 LOCK = threading.RLock()
 PNL_LOCK = threading.Lock()
+# Entrada opuesta válida solo junto al cierre de la MISMA vela de 5m.
+# No añade temporizador/espera para ejecutar órdenes.
+PAIR_MAX_DELAY_SECONDS = 45
+PAIR_BAR_SECONDS = 300
+PAIR_KEY = 'pending_opposite_entry'
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger('wti-3m')
+logger = logging.getLogger('wti-5m')
 
 
 def now():
@@ -829,19 +834,128 @@ def reconcile_pending(force=False):
                 'reasons': reasons[:5]}
 
 
-def process_signal(action):
+def bar_start_ms(payload):
+    """La marca {{time}} de TradingView es el INICIO de la vela de 5m."""
+    raw = str(payload.get('bar_time') or '').strip()
+    # No utilizar un ID arbitrario como si fuese una hora de vela.
+    return epoch_ms(raw) if raw and '{{' not in raw else 0
+
+
+def fresh_paired_bar(start_ms):
+    """No recuperar entradas de velas históricas o alertas muy tardías."""
+    if not start_ms:
+        return False
+    elapsed = time.time() * 1000 - (start_ms + PAIR_BAR_SECONDS * 1000)
+    # Se admite un pequeño desfase de reloj, pero nunca señales viejas.
+    return -30000 <= elapsed <= PAIR_MAX_DELAY_SECONDS * 1000
+
+
+def clear_paired_entry(reason=None):
+    item = store.get(PAIR_KEY, None)
+    if item:
+        store.set(PAIR_KEY, None)
+        if reason:
+            store.event('PAIR_CANCELLED', reason)
+
+
+def get_fresh_paired_entry():
+    item = store.get(PAIR_KEY, None)
+    if not item:
+        return None
+    if (not fresh_paired_bar(int(item.get('bar_ms') or 0))
+            or time.time() - number(item.get('received_at')) > PAIR_MAX_DELAY_SECONDS):
+        clear_paired_entry('Entrada opuesta vencida; no ejecutada')
+        return None
+    return item
+
+
+def entry_allowed(action, mode):
+    return ((action == 'LONG' and mode in ('LONG_ONLY', 'BOTH'))
+            or (action == 'SHORT' and mode in ('SHORT_ONLY', 'BOTH')))
+
+
+def process_signal(action, payload=None):
+    """Coordina dos alertas independientes, sin invertir por una sola salida.
+
+    Es invocado dentro de LOCK. Una entrada opuesta recibida antes de su XL/XS
+    permanece en Upstash unos segundos. Al llegar el cierre de la MISMA vela,
+    espera únicamente a que BingX confirme FLAT y entonces abre la entrada.
+    """
+    payload = payload or {}
     mode = store.mode()
     if mode == 'OFF':
+        clear_paired_entry('Modo OFF')
         return {'status': 'ignored', 'reason': 'mode_off'}
-    if action == 'XL':
-        return close_trade('LONG', 'tradingview_XL_3m')
-    if action == 'XS':
-        return close_trade('SHORT', 'tradingview_XS_3m')
-    if action == 'LONG' and mode in ('LONG_ONLY', 'BOTH'):
-        return open_trade('LONG')
-    if action == 'SHORT' and mode in ('SHORT_ONLY', 'BOTH'):
-        return open_trade('SHORT')
-    return {'status': 'ignored', 'reason': 'mode_disallows_entry'}
+
+    pending = get_fresh_paired_entry()
+    bar_ms = bar_start_ms(payload)
+
+    if action in ('XL', 'XS'):
+        direction = 'LONG' if action == 'XL' else 'SHORT'
+        paired_action = 'SHORT' if action == 'XL' else 'LONG'
+        should_pair = bool(
+            pending
+            and pending.get('entry') == paired_action
+            and pending.get('exit') == action
+            and bar_ms
+            and int(pending.get('bar_ms') or 0) == bar_ms
+            and pending.get('symbol') == str(payload.get('symbol', '')).upper().strip()
+            and entry_allowed(paired_action, mode)
+            and fresh_paired_bar(bar_ms)
+        )
+        # Si la posición cambió mientras esperábamos, no usar una señal vieja.
+        if should_pair and pending.get('position_id'):
+            live_positions = bingx.positions()
+            should_pair = (
+                len(live_positions) == 1
+                and live_positions[0]['side'] == direction
+                and str(live_positions[0].get('position_id') or '') == str(pending['position_id'])
+            )
+            if not should_pair:
+                clear_paired_entry('Posición original ya no coincide')
+
+        closed = close_trade(direction, f'tradingview_{action}_5m')
+        if not should_pair or closed.get('status') != 'closed':
+            return closed
+
+        # El cierre ya está confirmado FLAT en close_trade().
+        # Limpiar antes de intentar abrir: jamás reintentar a ciegas una MARKET.
+        clear_paired_entry()
+        store.event('PAIR_MATCHED', f'{action} + {paired_action} de la misma vela; FLAT confirmado')
+        try:
+            opened = open_trade(paired_action)
+        except Exception as exc:
+            store.event('PAIR_OPEN_ERROR', safe_error(exc))
+            raise
+        return {'status': 'closed_and_opened', 'close': closed, 'entry': opened}
+
+    if action not in ('LONG', 'SHORT') or not entry_allowed(action, mode):
+        return {'status': 'ignored', 'reason': 'mode_disallows_entry'}
+
+    live = sync_position()
+    if not live:
+        # Entrada normal en FLAT: se ejecuta inmediatamente sin esperar a XL/XS.
+        clear_paired_entry()
+        return open_trade(action)
+    if live['side'] == action:
+        return {'status': 'ignored', 'reason': 'position_already_open'}
+
+    # Entrada opuesta recibida antes del cierre: solo emparejar misma vela.
+    if not fresh_paired_bar(bar_ms):
+        return {'status': 'ignored', 'reason': 'opposite_position_open_without_fresh_bar_time'}
+    exit_action = 'XL' if live['side'] == 'LONG' else 'XS'
+    if pending and pending.get('bar_ms') == bar_ms and pending.get('entry') != action:
+        return {'status': 'ignored', 'reason': 'conflicting_pending_signal'}
+    store.set(PAIR_KEY, {
+        'entry': action,
+        'exit': exit_action,
+        'bar_ms': bar_ms,
+        'symbol': str(payload.get('symbol', '')).upper().strip(),
+        'position_id': str(live.get('position_id') or ''),
+        'received_at': time.time(),
+    })
+    store.event('ENTRY_QUEUED', f'{action} espera {exit_action} de la misma vela; no se abrió orden')
+    return {'status': 'queued_for_matching_exit', 'entry': action, 'requires': exit_action}
 
 
 def normalize_trade(item):
@@ -933,7 +1047,7 @@ def summary(trades):
 
 PANEL = r'''<!doctype html>
 <html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BOT PETRÓLEO WTI 3M</title>
+<title>BOT PETRÓLEO WTI 5M</title>
 <style>
 :root{--bg:#070a0f;--panel:#151a21;--inner:#0e1218;--stroke:#2d3541;--white:#f4f7fa;--gray:#a3adbc;--green:#00d489;--red:#fc536b;--blue:#3977e9;--gold:#cfa01a}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--white);font:15px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
@@ -948,8 +1062,8 @@ table{border-collapse:collapse;width:100%;font-size:12px}th,td{border-bottom:1px
 #curve{display:block;width:100%;height:240px;background:#080c12;border-radius:14px}
 @media(max-width:800px){.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:500px){h1{font-size:25px}.card{padding:16px}.stat strong{font-size:21px}}
 </style></head><body><main>
-<h1>🛢 BOT PETRÓLEO WTI 3M</h1>
-<p class="center muted">{{symbol}} · 3M · {{leverage}}x · ISOLATED · {{percent}}% del balance · REAL</p>
+<h1>🛢 BOT PETRÓLEO WTI 5M</h1>
+<p class="center muted">{{symbol}} · 5M · {{leverage}}x · ISOLATED · {{percent}}% del balance · REAL</p>
 <section class="card center"><span class="muted">MODO ACTUAL</span><div class="mode">{{mode_label}}</div></section>
 <section class="grid">
 {% for code,label,style in modes %}<form method="post" action="/setmode/{{code}}?secret={{secret}}"><button class="{{style}}">{{label}}</button></form>{% endfor %}
@@ -1023,7 +1137,7 @@ def root():
 
 @app.get('/health')
 def health():
-    return jsonify({'ok': True, 'bot': BOT_NAME, 'symbol': SYMBOL, 'mode': store.mode(), 'timeframe': '3m', 'state_prefix': STATE_PREFIX, 'redis': store.redis, 'version': 'WTI-REAL-PNL-6-EXCLUSIVE-DD-REALIZED'})
+    return jsonify({'ok': True, 'bot': BOT_NAME, 'symbol': SYMBOL, 'mode': store.mode(), 'timeframe': '5m', 'state_prefix': STATE_PREFIX, 'redis': store.redis, 'version': 'WTI-5M-REAL-PNL-8-SAME-BAR-PAIR'})
 
 
 @app.get('/control')
@@ -1066,6 +1180,7 @@ def setmode(mode):
         return 'Modo no válido', 400
     with LOCK:
         store.set('mode', {'mode': mode, 'updated_at': now()})
+        clear_paired_entry('Cambio de modo: señal pendiente descartada')
     store.event('MODE', f'Modo cambiado a {mode}')
     telegram(f'{BOT_NAME}\nModo: {mode}')
     return redirect('/control?secret=' + request.args['secret'])
@@ -1159,7 +1274,7 @@ def export_json():
     if not panel_authorized():
         return 'No autorizado', 403
     content = json.dumps({'app': BOT_NAME, 'version': 2, 'exportedAt': now(), 'trades': store.trades()}, ensure_ascii=False, indent=2).encode('utf-8')
-    return send_file(io.BytesIO(content), mimetype='application/json', as_attachment=True, download_name='wti_3m_historial.json')
+    return send_file(io.BytesIO(content), mimetype='application/json', as_attachment=True, download_name='wti_5m_historial.json')
 
 
 @app.get('/download')
@@ -1172,7 +1287,7 @@ def download():
     writer.writeheader()
     for row in store.trades():
         writer.writerow(row)
-    return send_file(io.BytesIO(output.getvalue().encode('utf-8-sig')), mimetype='text/csv', as_attachment=True, download_name='wti_3m_historial.csv')
+    return send_file(io.BytesIO(output.getvalue().encode('utf-8-sig')), mimetype='text/csv', as_attachment=True, download_name='wti_5m_historial.csv')
 
 
 @app.post('/webhook')
@@ -1189,18 +1304,18 @@ def webhook():
         return jsonify({'error': 'Usa LONG, SHORT, XL o XS'}), 400
     if symbol not in TV_SYMBOLS and symbol != SYMBOL:
         return jsonify({'error': 'Símbolo WTI no permitido', 'symbol': symbol}), 400
-    if timeframe not in ('3', '3m'):
-        return jsonify({'error': 'Temporalidad debe ser 3M'}), 400
+    if timeframe not in ('5', '5m'):
+        return jsonify({'error': 'Temporalidad debe ser 5M'}), 400
     stamp = str(payload.get('signal_id') or payload.get('bar_time') or '').strip()
     signal = f'{symbol}:{timeframe}:{action}:{stamp}' if stamp else ''
-    store.event('WEBHOOK_RECEIVED', f'{action} {symbol} 3M')
+    store.event('WEBHOOK_RECEIVED', f'{action} {symbol} 5M')
     try:
         with LOCK:
             if signal and store.seen(signal):
                 return jsonify({'ok': True, 'result': {'status': 'ignored', 'reason': 'duplicate_signal'}})
             if signal:
                 store.remember(signal)
-            result = process_signal(action)
+            result = process_signal(action, payload)
             store.event('WEBHOOK_PROCESSED', json.dumps(result, ensure_ascii=False)[:450])
             return jsonify({'ok': True, 'result': result})
     except Exception as exc:
