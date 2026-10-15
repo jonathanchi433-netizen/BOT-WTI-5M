@@ -78,6 +78,59 @@ def safe_error(message):
     return text[:500]
 
 
+# Diagnostico seguro: nunca registra valores de la cuenta ni credenciales.
+def pnl_shape(value, depth=0):
+    if depth >= 4:
+        return type(value).__name__
+    if isinstance(value, dict):
+        keys = sorted(str(k) for k in value.keys())[:18]
+        parts = [f"dict(keys={keys})"]
+        for key in ("data", "list", "positions", "positionHistory",
+                    "records", "rows", "items", "result", "history",
+                    "positionHistoryList", "closedPositions"):
+            if key in value:
+                parts.append(f"{key}={pnl_shape(value[key], depth + 1)}")
+                break
+        return " ".join(parts)
+    if isinstance(value, list):
+        return (f"list(count={len(value)}"
+                + (f", first={pnl_shape(value[0], depth + 1)}" if value else "")
+                + ")")
+    if isinstance(value, str):
+        return f"str(length={len(value)})"
+    if value is None:
+        return "null"
+    return type(value).__name__
+
+
+def pnl_rows(value, depth=0):
+    """Acepta únicamente listas de historiales o objetos inequívocos."""
+    if depth > 5:
+        return None
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            return pnl_rows(json.loads(value), depth + 1)
+        except (ValueError, TypeError):
+            return None
+    if isinstance(value, dict):
+        if ("positionId" in value or "positionSide" in value) and (
+            "openTime" in value or "netProfit" in value
+        ):
+            return [value]
+        for key in ("list", "positions", "positionHistory", "records",
+                    "rows", "items", "data", "result", "history",
+                    "positionHistoryList", "closedPositions"):
+            if key in value and value[key] is not None:
+                result = pnl_rows(value[key], depth + 1)
+                if result is not None:
+                    return result
+        if value.get("total") in (0, "0"):
+            return []
+    return None
+
+
 def telegram(message):
     if TG_TOKEN and TG_CHAT:
         try:
@@ -161,7 +214,7 @@ store = Store()
 
 
 class BingX:
-    def call(self, method, path, params=None, private=True):
+    def call(self, method, path, params=None, private=True, envelope=False):
         params = dict(params or {})
         headers = {}
         if private:
@@ -182,7 +235,7 @@ class BingX:
             raise RuntimeError(f'BingX no devolvió JSON (HTTP {response.status_code})')
         if response.status_code >= 400 or str(result.get('code')) != '0':
             raise RuntimeError('Error BingX: ' + safe_error(result))
-        return result.get('data')
+        return result if envelope else result.get('data')
 
     def price(self):
         data = self.call('GET', '/openApi/swap/v2/quote/price', {'symbol': SYMBOL}, False)
@@ -280,39 +333,63 @@ class BingX:
     # --------------------------------------------------------
 
     def position_history(self, start_ms, end_ms):
-        """Consulta positionHistory. Solo operaciones reales; no emite órdenes."""
+        """Historial real de posiciones. Diagnostico sin datos privados."""
         rows = []
         page_size = 100
         for page in range(1, 21):
-            data = self.call('GET', '/openApi/swap/v1/trade/positionHistory', {
-                'symbol': SYMBOL,
-                'currency': 'USDT',
-                'startTs': int(start_ms),
-                'endTs': int(end_ms),
-                'pageIndex': page,
-                'pageSize': page_size,
-            })
-            if isinstance(data, dict):
-                current = data.get('list')
-                if current is None:
-                    current = data.get('positions')
-                if current is None:
-                    current = data.get('data')
-                total = data.get('total')
-            elif isinstance(data, list):
-                current, total = data, None
-            else:
-                raise RuntimeError('Formato no reconocido en positionHistory')
-            if not isinstance(current, list):
-                raise RuntimeError('BingX no devolvió lista de posiciones cerradas')
+            response = self.call(
+                'GET',
+                '/openApi/swap/v1/trade/positionHistory',
+                {
+                    'symbol': SYMBOL,
+                    'currency': 'USDT',
+                    'startTs': int(start_ms),
+                    'endTs': int(end_ms),
+                    'pageIndex': page,
+                    'pageSize': page_size,
+                },
+                envelope=True,
+            )
+            # No se guarda el cuerpo ni los valores de la respuesta.
+            data = response.get('data') if isinstance(response, dict) else None
+            store.event(
+                'PNL_DIAGNOSTIC',
+                f"positionHistory page={page}; "
+                f"code={response.get('code') if isinstance(response, dict) else 'unknown'}; "
+                f"envelope_keys={sorted(response.keys()) if isinstance(response, dict) else []}; "
+                f"data={pnl_shape(data)}"
+            )
+
+            current = pnl_rows(data)
+            if current is None:
+                raise RuntimeError(
+                    'Formato de positionHistory no reconocido; ' 
+                    'envíame el evento PNL_DIAGNOSTIC'
+                )
+            if not all(isinstance(item, dict) for item in current):
+                raise RuntimeError(
+                    'La lista de historial tiene elementos inesperados; ' 
+                    'ver PNL_DIAGNOSTIC'
+                )
+
             rows.extend(current)
+            total = None
+            if isinstance(data, dict):
+                total = data.get('total')
+                if total is None and isinstance(data.get('data'), dict):
+                    total = data['data'].get('total')
             if total is not None:
-                if len(rows) >= int(total):
-                    break
-            elif len(current) < page_size:
+                try:
+                    if len(rows) >= int(total):
+                        break
+                except (TypeError, ValueError):
+                    raise RuntimeError('Total de posiciones desconocido')
+            if len(current) < page_size:
                 break
         else:
-            raise RuntimeError('Historial paginado incompleto; no se atribuye PnL')
+            raise RuntimeError(
+                'Historial paginado incompleto; no se atribuye PnL'
+            )
         return rows
 
 
