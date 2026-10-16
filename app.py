@@ -15,10 +15,10 @@ from urllib.parse import urlencode
 import requests
 from flask import Flask, jsonify, redirect, render_template_string, request, send_file
 
-# BOT PETROLEO WTI 5 MIN - ORDENES REALES
+# BOT PETROLEO WTI 15 MIN - ORDENES REALES
 # SHORT/LONG: abren solo si FLAT. XL/XS: cierran el lado correspondiente.
 # Sin reversion automatica, sin TP/SL añadidos, sin simulacion.
-BOT_NAME = 'BOT PETRÓLEO WTI 5M'
+BOT_NAME = 'BOT PETRÓLEO WTI 15M'
 BASE = 'https://open-api.bingx.com'
 SYMBOL = os.getenv('BINGX_SYMBOL', 'NCCO1OILWTI2USD-USDT').strip().upper()
 TV_SYMBOLS = {s.strip().upper() for s in os.getenv('TV_SYMBOLS', 'OILWTIUSDT.P,BINGX:OILWTIUSDT.P,OILWTI-USDT,OILWTIUSDT').split(',') if s.strip()}
@@ -34,18 +34,18 @@ LEVERAGE = int(os.getenv('LEVERAGE', '2'))
 DATA_DIR = os.getenv('DATA_DIR', '.')
 REDIS_URL = os.getenv('UPSTASH_REDIS_REST_URL', '').strip()
 REDIS_TOKEN = os.getenv('UPSTASH_REDIS_REST_TOKEN', '').strip()
-STATE_PREFIX = 'bot_petroleo_wti_5m_v1'  # Historial 5M independiente; el 3M permanece en bot_petroleo_wti_3m_v1.
+STATE_PREFIX = 'bot_petroleo_wti_15m_v1'  # Historial 15M independiente: conserva las claves 3M y 5M en Redis.
 MODES = ('OFF', 'LONG_ONLY', 'SHORT_ONLY', 'CLOSE_ONLY', 'BOTH')
 LOCK = threading.RLock()
 PNL_LOCK = threading.Lock()
-# Entrada opuesta válida solo junto al cierre de la MISMA vela de 5m.
+# Entrada opuesta válida solo junto al cierre de la MISMA vela de 15m.
 # No añade temporizador/espera para ejecutar órdenes.
 PAIR_MAX_DELAY_SECONDS = 45
-PAIR_BAR_SECONDS = 300
+PAIR_BAR_SECONDS = 900
 PAIR_KEY = 'pending_opposite_entry'
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger('wti-5m')
+logger = logging.getLogger('wti-15m')
 
 
 def now():
@@ -835,7 +835,7 @@ def reconcile_pending(force=False):
 
 
 def bar_start_ms(payload):
-    """La marca {{time}} de TradingView es el INICIO de la vela de 5m."""
+    """La marca {{time}} de TradingView es el INICIO de la vela de 15m."""
     raw = str(payload.get('bar_time') or '').strip()
     # No utilizar un ID arbitrario como si fuese una hora de vela.
     return epoch_ms(raw) if raw and '{{' not in raw else 0
@@ -914,7 +914,7 @@ def process_signal(action, payload=None):
             if not should_pair:
                 clear_paired_entry('Posición original ya no coincide')
 
-        closed = close_trade(direction, f'tradingview_{action}_5m')
+        closed = close_trade(direction, f'tradingview_{action}_15m')
         if not should_pair or closed.get('status') != 'closed':
             return closed
 
@@ -1047,7 +1047,7 @@ def summary(trades):
 
 PANEL = r'''<!doctype html>
 <html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BOT PETRÓLEO WTI 5M</title>
+<title>BOT PETRÓLEO WTI 15M</title>
 <style>
 :root{--bg:#070a0f;--panel:#151a21;--inner:#0e1218;--stroke:#2d3541;--white:#f4f7fa;--gray:#a3adbc;--green:#00d489;--red:#fc536b;--blue:#3977e9;--gold:#cfa01a}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--white);font:15px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
@@ -1062,8 +1062,8 @@ table{border-collapse:collapse;width:100%;font-size:12px}th,td{border-bottom:1px
 #curve{display:block;width:100%;height:240px;background:#080c12;border-radius:14px}
 @media(max-width:800px){.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:500px){h1{font-size:25px}.card{padding:16px}.stat strong{font-size:21px}}
 </style></head><body><main>
-<h1>🛢 BOT PETRÓLEO WTI 5M</h1>
-<p class="center muted">{{symbol}} · 5M · {{leverage}}x · ISOLATED · {{percent}}% del balance · REAL</p>
+<h1>🛢 BOT PETRÓLEO WTI 15M</h1>
+<p class="center muted">{{symbol}} · 15M · {{leverage}}x · ISOLATED · {{percent}}% del balance · REAL</p>
 <section class="card center"><span class="muted">MODO ACTUAL</span><div class="mode">{{mode_label}}</div></section>
 <section class="grid">
 {% for code,label,style in modes %}<form method="post" action="/setmode/{{code}}?secret={{secret}}"><button class="{{style}}">{{label}}</button></form>{% endfor %}
@@ -1137,7 +1137,7 @@ def root():
 
 @app.get('/health')
 def health():
-    return jsonify({'ok': True, 'bot': BOT_NAME, 'symbol': SYMBOL, 'mode': store.mode(), 'timeframe': '5m', 'state_prefix': STATE_PREFIX, 'redis': store.redis, 'version': 'WTI-5M-REAL-PNL-8-SAME-BAR-PAIR'})
+    return jsonify({'ok': True, 'bot': BOT_NAME, 'symbol': SYMBOL, 'mode': store.mode(), 'timeframe': '15m', 'state_prefix': STATE_PREFIX, 'redis': store.redis, 'version': 'WTI-15M-REAL-PNL-8-SAME-BAR-PAIR'})
 
 
 @app.get('/control')
@@ -1274,7 +1274,7 @@ def export_json():
     if not panel_authorized():
         return 'No autorizado', 403
     content = json.dumps({'app': BOT_NAME, 'version': 2, 'exportedAt': now(), 'trades': store.trades()}, ensure_ascii=False, indent=2).encode('utf-8')
-    return send_file(io.BytesIO(content), mimetype='application/json', as_attachment=True, download_name='wti_5m_historial.json')
+    return send_file(io.BytesIO(content), mimetype='application/json', as_attachment=True, download_name='wti_15m_historial.json')
 
 
 @app.get('/download')
@@ -1287,7 +1287,7 @@ def download():
     writer.writeheader()
     for row in store.trades():
         writer.writerow(row)
-    return send_file(io.BytesIO(output.getvalue().encode('utf-8-sig')), mimetype='text/csv', as_attachment=True, download_name='wti_5m_historial.csv')
+    return send_file(io.BytesIO(output.getvalue().encode('utf-8-sig')), mimetype='text/csv', as_attachment=True, download_name='wti_15m_historial.csv')
 
 
 @app.post('/webhook')
@@ -1304,11 +1304,11 @@ def webhook():
         return jsonify({'error': 'Usa LONG, SHORT, XL o XS'}), 400
     if symbol not in TV_SYMBOLS and symbol != SYMBOL:
         return jsonify({'error': 'Símbolo WTI no permitido', 'symbol': symbol}), 400
-    if timeframe not in ('5', '5m'):
-        return jsonify({'error': 'Temporalidad debe ser 5M'}), 400
+    if timeframe not in ('15', '15m'):
+        return jsonify({'error': 'Temporalidad debe ser 15M'}), 400
     stamp = str(payload.get('signal_id') or payload.get('bar_time') or '').strip()
     signal = f'{symbol}:{timeframe}:{action}:{stamp}' if stamp else ''
-    store.event('WEBHOOK_RECEIVED', f'{action} {symbol} 5M')
+    store.event('WEBHOOK_RECEIVED', f'{action} {symbol} 15M')
     try:
         with LOCK:
             if signal and store.seen(signal):
